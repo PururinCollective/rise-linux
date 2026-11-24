@@ -537,8 +537,10 @@ do_install() {
 	[ -x "$TARGET/usr/lib/rise/banner" ] || { fail "copying the system from $sq"; return; }
 
 	progress 72 "Configuring"
-	# slave mounts: unmounting them later never reaches the live system's own
-	mount --make-rprivate "$TARGET"
+	# /target stays shared, so unmounting it reaches the copies that sandboxed
+	# services (logind, resolved, udevd) hold in their own mount namespaces;
+	# the binds below are slaves, so unmounting them never reaches the live
+	# system's /dev and /sys
 	run mount -t proc proc "$TARGET/proc"
 	run mount --rbind /sys "$TARGET/sys" && mount --make-rslave "$TARGET/sys"
 	run mount --rbind /dev "$TARGET/dev" && mount --make-rslave "$TARGET/dev"
