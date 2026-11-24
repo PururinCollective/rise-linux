@@ -40,8 +40,12 @@ bt() {
 # D <title> <dialog args...>: prints the answer; returns dialog's status
 D() {
 	local title=$1; shift
+	local rc
 	dialog --backtitle "$(bt "$title")" --title " $title " --no-shadow --colors \
 		--cr-wrap --no-collapse "$@" 2>&1 >/dev/tty
+	rc=$?
+	echo "dialog '$title': $rc" >&2
+	return $rc
 }
 msg() { D "$1" --msgbox "$2" "${3:-12}" "${4:-72}" >/dev/null; }
 yesno() { D "$1" --yesno "$2" "${3:-10}" "${4:-72}" >/dev/null; }
@@ -493,7 +497,8 @@ write_secrets() {
 }
 
 do_install() {
-	local sq=$1 esp root
+	local sq
+	echo "==== install attempt $(date -u +%T) on $DISK" >&2=$1 esp root
 	progress 2 "Partitioning $DISK"
 	swapoff -a 2>/dev/null
 	umount -R "$TARGET" 2>/dev/null
@@ -592,6 +597,7 @@ unmount_target() {
 
 install() {
 	local sq
+	echo "==== install attempt $(date -u +%T) on $DISK" >&2
 	sq=$(find_squashfs) || { msg "Install" "\nThe system image (casper/filesystem.squashfs) was not found on the\ninstallation medium."; return 1; }
 	STEP=8
 	local start
