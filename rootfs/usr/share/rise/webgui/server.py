@@ -685,9 +685,10 @@ def act_cert(d):
 
 
 def weak_psk(psk):
-    low = psk.lower()
-    return len(psk) < 8 or low.startswith(("vpn", "password", "12345678", "qwerty", "softether",
-                                           "ipsec", "secret", "changeme"))
+    """Short, digits only, or a usual word with digits after it (vpn, vpn123, password1)."""
+    return len(psk) < 8 or bool(re.fullmatch(
+        r"(vpn|password|passw0rd|qwerty|softether|ipsec|secret|changeme|admin|letmein|test)?[0-9]*",
+        psk.lower()))
 
 
 def act_vpn(d):

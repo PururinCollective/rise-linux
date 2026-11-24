@@ -76,11 +76,11 @@ server_addr() {
 	echo "${a%/*}"
 }
 
-# a key anyone could guess: short, or one of the usual ones
+# a key anyone could guess: short, digits only, or a usual word with digits
+# after it (vpn, vpn123, password1); a random key is not weak for its prefix
 weak_psk() {
 	[ ${#1} -lt 8 ] && return 0
-	case "${1,,}" in vpn*|password*|12345678*|qwerty*|softether*|ipsec*|secret*|changeme*) return 0 ;; esac
-	return 1
+	[[ ${1,,} =~ ^(vpn|password|passw0rd|qwerty|softether|ipsec|secret|changeme|admin|letmein|test)?[0-9]*$ ]]
 }
 
 # ---- the live system ------------------------------------------------------------------
