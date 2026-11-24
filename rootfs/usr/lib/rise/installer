@@ -101,8 +101,8 @@ live_consoles() {
 	ExecStart=
 	ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
 	EOF
+	# a console that is switched to later starts with it (autovt@ is getty@)
 	systemctl daemon-reload
-	systemctl try-restart 'getty@tty2.service' 'getty@tty3.service' 2>/dev/null || true
 }
 
 live_network() {
@@ -594,7 +594,7 @@ unmount_target() {
 	umount -R "$TARGET" 2>/dev/null || umount -lR "$TARGET" 2>/dev/null
 }
 
-install() {
+run_install() {
 	local sq
 	echo "==== install attempt $(date -u +%T) on $DISK" >&2
 	sq=$(find_squashfs) || { msg "Install" "\nThe system image (casper/filesystem.squashfs) was not found on the\ninstallation medium."; return 1; }
@@ -647,7 +647,7 @@ main() {
 		softether) ask_softether && s=webgui || s=vpnnet ;;
 		webgui) ask_webgui && s=summary || s=softether ;;
 		summary) summary && s=install || s=webgui ;;
-		install) if install; then finish; return; else s=failed; fi ;;
+		install) if run_install; then finish; return; else s=failed; fi ;;
 		failed)
 			D "Install failed" --yes-label "Back" --no-label "Shell" --yesno \
 "\nThe install did not finish. Its log is $LOG (tty2 has a root shell).\n\n\
