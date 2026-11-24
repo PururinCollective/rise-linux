@@ -500,14 +500,26 @@ do_install() {
 	local sq=$1 esp root
 	progress 2 "Partitioning $DISK"
 	swapoff -a 2>/dev/null
-	umount -R "$TARGET" 2>/dev/null
-	for p in $(lsblk -lnpo NAME "$DISK" | tail -n +2); do umount "$p" 2>/dev/null; done
+	# free the disk: a previous attempt may have left its partitions mounted
+	umount -R "$TARGET" 2>/dev/null || umount -lR "$TARGET" 2>/dev/null
+	local p m
+	for p in $(lsblk -lnpo NAME "$DISK" | tail -n +2); do
+		for m in $(findmnt -rno TARGET -S "$p" 2>/dev/null); do umount -l "$m" 2>/dev/null; done
+	done
+	udevadm settle
 	run wipefs -af "$DISK" || { fail "wipefs $DISK"; return; }
 	run sgdisk -Z "$DISK"
 	# BIOS boot + EFI system + root: the disk boots in either firmware mode
 	run sgdisk -n1:1M:+1M -t1:EF02 -c1:bios -n2:0:+512M -t2:EF00 -c2:EFI -n3:0:0 -t3:8304 -c3:rise-root "$DISK" ||
 		{ fail "partitioning $DISK"; return; }
-	run partprobe "$DISK"; udevadm settle; sleep 1
+	# the kernel must see the new table before anything is formatted
+	local i
+	for i in 1 2 3 4 5; do
+		run partprobe "$DISK" && break
+		run partx -u "$DISK" && break
+		sleep 2
+	done
+	udevadm settle; sleep 1
 	esp=$(part "$DISK" 2); root=$(part "$DISK" 3)
 	progress 5 "Formatting"
 	run mkfs.vfat -F 32 -n EFI "$esp" || { fail "mkfs.vfat $esp"; return; }

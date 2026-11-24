@@ -96,8 +96,9 @@ sudo dd if=out/rise-linux-*.iso of=/dev/sdX bs=4M status=progress oflag=sync
 
 ## Install
 
-Boot the ISO. The installer runs on tty1; tty2 to tty6 have a shell for the live
-user. It asks for:
+Boot the ISO. The installer runs on tty1, and tty2 to tty6 have a root shell
+(Alt+F2) for troubleshooting; its log is `/var/log/rise-installer.log`. It asks
+for:
 
 1. **Storage**: the disk to erase.
 2. **Network**: the WAN interface (`eth0`), IPv4 by DHCP or static, and IPv6 as
