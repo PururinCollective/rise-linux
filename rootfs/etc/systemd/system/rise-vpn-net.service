@@ -1,0 +1,8 @@
+[Unit]
+Description=RISE VPN interface (addresses, MTU, proxy-ARP)
+BindsTo=sys-subsystem-net-devices-tap_vpn.device
+After=sys-subsystem-net-devices-tap_vpn.device rise-vpnserver.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/rise/vpn-net up

@@ -1,0 +1,70 @@
+#!/bin/bash
+# rise -- RISE Linux on the command line (the WebGUI does the same things)
+#
+#   rise status                 services, addresses, NAT mode, certificate
+#   rise apply                  apply /etc/rise/rise.conf (firewall, DHCP, VPN side)
+#   rise restart                restart SoftEther VPN Server (drops sessions)
+#   rise firewall [show]        reload (or print) the firewall
+#   rise cert [status|obtain|renew]
+#   rise psk NEW                set the IPsec pre-shared key
+#   rise sessions               the VPN sessions
+#   rise webgui-passwd [USER]   set the WebGUI user and password
+#   rise console-mode MODE      1024x768 | 1920x1080 | ... | native (next boot)
+#   rise banner                 print the banner
+set -u
+. /usr/lib/rise/common.sh
+
+need_root() { [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"; }
+
+status() {
+	local s
+	printf '%-22s %s\n' "System" "$(. /etc/rise/release 2>/dev/null; echo "${RISE_NAME:-RISE Linux} ${RISE_VERSION:-?}") on $(. /etc/os-release; echo "$PRETTY_NAME"), kernel $(uname -r)"
+	printf '%-22s %s\n' "SoftEther" "$(cat /opt/softether/VERSION 2>/dev/null)"
+	for s in rise-vpnserver rise-dnsmasq rise-firewall rise-webgui rise-stats ssh; do
+		printf '%-22s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null)"
+	done
+	printf '%-22s %s\n' "WAN $WAN_IF" "$(wan_addr 4) $(wan_addr 6)"
+	printf '%-22s %s\n' "VPN $TAP_IF" "$(ip -br addr show dev "$TAP_IF" 2>/dev/null | cut -c17- || echo down)"
+	local fc4 fc6
+	fc4=$(cat "$RISE_RUN/fullcone4" 2>/dev/null); fc6=$(cat "$RISE_RUN/fullcone6" 2>/dev/null)
+	printf '%-22s IPv4 %s, IPv6 %s\n' "NAT" "$([ "$fc4" = 1 ] && echo "full cone" || echo masquerade)" \
+		"$(is_on "$NAT66" || echo off; is_on "$NAT66" && { [ "$fc6" = 1 ] && echo "full cone NAT66" || echo "NAT66 masquerade"; })"
+	printf '%-22s %s\n' "WebGUI" "https://${VPN_DOMAIN:-$(wan_addr 4 | cut -d/ -f1)}:$WEBGUI_PORT"
+	printf '%-22s %s\n' "SSH" "port $SSH_PORT"
+	[ -e "$RISE_STATE/firstboot-pending" ] && printf '%-22s %s\n' "First boot" "SoftEther is not configured yet (rise-firstboot.service)"
+	echo
+	/usr/lib/rise/cert status
+}
+
+apply() {
+	/usr/lib/rise/firewall reload
+	[ -e "/sys/class/net/$TAP_IF" ] && /usr/lib/rise/vpn-net up
+	systemctl restart rise-dnsmasq.service
+	/usr/lib/rise/softether-setup isolation >/dev/null 2>&1 || true
+	echo "applied"
+}
+
+cmd=${1:-status}
+shift || true
+case "$cmd" in
+status) status ;;
+apply) need_root "$cmd" "$@"; apply ;;
+restart) need_root "$cmd" "$@"; systemctl restart rise-vpnserver.service ;;
+firewall) need_root "$cmd" "$@"; if [ "${1:-}" = show ]; then /usr/lib/rise/firewall show; else /usr/lib/rise/firewall reload; fi ;;
+cert) need_root "$cmd" "$@"; /usr/lib/rise/cert "${1:-status}" ;;
+psk) need_root "$cmd" "$@"; /usr/lib/rise/softether-setup psk "${1:?usage: rise psk NEW}" ;;
+sessions) need_root "$cmd" "$@"; se @hub SessionList ;;
+webgui-passwd)
+	need_root "$cmd" "$@"
+	u=${1:-}
+	[ -n "$u" ] || read -r -p "WebGUI user: " u
+	read -r -s -p "New password: " p1; echo
+	read -r -s -p "Again: " p2; echo
+	[ "$p1" = "$p2" ] || { echo "the passwords differ" >&2; exit 1; }
+	printf '%s' "$p1" | python3 -I /usr/share/rise/webgui/server.py --set-password "$u"
+	systemctl try-restart rise-webgui.service ;;
+console-mode) need_root "$cmd" "$@"; /usr/lib/rise/console mode "${1:?usage: rise console-mode 1024x768|WxH|native}" ;;
+banner) /usr/lib/rise/banner print ;;
+-h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+*) echo "rise: unknown command '$cmd' (rise help)" >&2; exit 2 ;;
+esac

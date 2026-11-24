@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the RISE login screen
+
+[Timer]
+OnActiveSec=1s
+OnUnitActiveSec=10s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

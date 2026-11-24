@@ -1,0 +1,9 @@
+# build output
+/build/
+/out/
+# the real example files hold a private key, password hashes and user names;
+# the *.sample copies next to them are sanitized
+/example/vpn_server.config
+/example/vpn_cert.sh
+__pycache__/
+*.pyc

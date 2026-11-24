@@ -1,0 +1,4 @@
+#!/bin/sh
+# certbot deploy hook: a new or renewed certificate goes into SoftEther and
+# the WebGUI (RENEWED_LINEAGE is the live directory certbot just updated)
+exec /usr/lib/rise/cert deploy

@@ -1,0 +1,12 @@
+#!/bin/bash
+
+/usr/bin/certbot renew --quiet --post-hook "systemctl reload apache2"
+/opt/vpnserver/vpncmd /server localhost /password:"$SOFTETHER_ADMIN_PASSWORD" /adminhub:VPN /cmd ServerCertSet /LOADCERT:/etc/letsencrypt/live/vpn.example.com/fullchain.pem /LOADKEY:/etc/letsencrypt/live/vpn.example.com/privkey.pem
+
+/opt/vpnserver/vpn_stop.sh &
+sleep 3
+
+/opt/vpnserver/vpn_start.sh &
+sleep 3
+
+exit 0

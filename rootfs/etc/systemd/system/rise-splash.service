@@ -1,0 +1,18 @@
+[Unit]
+Description=RISE boot screen
+After=rise-console.service systemd-user-sessions.service
+Before=getty@tty1.service rise-installer.service
+ConditionPathExists=/dev/tty1
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/rise/banner splash
+StandardInput=null
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=no
+TimeoutStartSec=20
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=RISE Let's Encrypt certificate (obtain once, then certbot renews)
+After=network-online.target rise-firewall.service
+Wants=network-online.target
+ConditionPathExists=/etc/rise/rise.conf
+ConditionKernelCommandLine=!boot=casper
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/rise/cert obtain

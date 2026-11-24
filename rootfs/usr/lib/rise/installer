@@ -1,0 +1,633 @@
+#!/bin/bash
+# installer -- the RISE Linux installer, on tty1 of the live ISO
+# (rise-installer.service, kernel option rise.installer).
+#
+# Asks: the disk; the WAN interface with IPv4 and IPv6 (DHCP or static); the
+# profile (name, hostname, sudo user, password, SSH keys); the VPN domain
+# (Let's Encrypt); the VPN network (default or custom, proxy-ARP /32);
+# SoftEther's admin password, IPsec key and a first VPN user; the WebGUI login.
+# Then it erases the disk, copies the system from the ISO, writes the
+# settings and installs GRUB for both BIOS and UEFI.
+#
+# Nothing is written before the summary is confirmed.
+set -u
+
+LOG=/var/log/rise-installer.log
+TARGET=/target
+export DIALOGRC=/usr/share/rise/installer.dialogrc
+export TERM=${TERM:-linux}
+NSTEPS=8
+STEP=0
+TITLE="RISE Linux"
+. /etc/rise/release 2>/dev/null && TITLE="$RISE_NAME $RISE_VERSION"
+
+exec 2>>"$LOG"
+echo "==== installer started $(date -u)" >&2
+
+# ---- dialog helpers -----------------------------------------------------------------
+
+palette() { printf '\e]P0111111\e]P3E95420\e]PBE95420\e]P7EEEEEE\e]PFFFFFFF' > /dev/tty; }
+
+bt() {
+	local cols left right
+	cols=$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f2); cols=${cols:-80}
+	left=" $TITLE installer  ::  $1"
+	right="$STEP / $NSTEPS "
+	[ "$STEP" = 0 ] && right=""
+	printf '%s%*s' "$left" $(( cols - ${#left} - 2 )) "$right"
+}
+
+# D <title> <dialog args...>: prints the answer; returns dialog's status
+D() {
+	local title=$1; shift
+	dialog --backtitle "$(bt "$title")" --title " $title " --no-shadow --colors \
+		--cr-wrap --no-collapse "$@" 2>&1 >/dev/tty
+}
+msg() { D "$1" --msgbox "$2" "${3:-12}" "${4:-72}" >/dev/null; }
+yesno() { D "$1" --yesno "$2" "${3:-10}" "${4:-72}" >/dev/null; }
+
+# a value with nothing but what it should have
+valid_hostname() { [[ $1 =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; }
+valid_fqdn() { [[ $1 =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]; }
+valid_user() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && ! getent passwd "$1" >/dev/null 2>&1 && [ "$1" != root ]; }
+valid_vpnuser() { [[ $1 =~ ^[A-Za-z0-9._-]{1,63}$ ]]; }
+
+# py: one-line checks with the ipaddress module
+py() { python3 -I -c "import ipaddress,sys
+$1" "${@:2}" 2>/dev/null; }
+v4_iface() { py 'i=ipaddress.ip_interface(sys.argv[1]); assert i.version==4 and 0<i.network.prefixlen<32 and i.ip!=i.network.network_address' "$1"; }
+v4_addr() { py 'assert ipaddress.ip_address(sys.argv[1]).version==4' "$1"; }
+v6_iface() { py 'i=ipaddress.ip_interface(sys.argv[1]); assert i.version==6 and 0<i.network.prefixlen<128' "$1"; }
+v6_addr() { py 'assert ipaddress.ip_address(sys.argv[1]).version==6' "$1"; }
+in_net() { py 'assert ipaddress.ip_address(sys.argv[1]) in ipaddress.ip_interface(sys.argv[2]).network' "$1" "$2"; }
+is_private4() { py 'a=ipaddress.ip_address(sys.argv[1]); assert a.is_private or a in ipaddress.ip_network("100.64.0.0/10")' "$1"; }
+dns_list_ok() { local a; for a in $1; do v4_addr "$a" || v6_addr "$a" || return 1; done; }
+rand() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-12}"; }
+
+# ---- the live system ------------------------------------------------------------------
+
+live_disk() {
+	local src
+	src=$(findmnt -no SOURCE /cdrom 2>/dev/null) || src=
+	[ -n "$src" ] || return 0
+	lsblk -no PKNAME "$src" 2>/dev/null | head -n1
+	basename "$src"
+}
+
+find_squashfs() {
+	local f
+	for f in /cdrom/casper/filesystem.squashfs /run/live/medium/casper/filesystem.squashfs; do
+		[ -r "$f" ] && { echo "$f"; return 0; }
+	done
+	# look on every block device that is not mounted yet
+	local dev m=/run/rise-installer/medium
+	mkdir -p "$m"
+	for dev in $(lsblk -rpno NAME,TYPE | awk '$2=="part"||$2=="rom"||$2=="disk"{print $1}'); do
+		mount -o ro "$dev" "$m" 2>/dev/null || continue
+		[ -r "$m/casper/filesystem.squashfs" ] && { echo "$m/casper/filesystem.squashfs"; return 0; }
+		umount "$m"
+	done
+	return 1
+}
+
+live_network() {
+	# DHCP on every wired interface of the live system, for ssh-import-id and
+	# to see whether the address is private
+	mkdir -p /run/systemd/network
+	cat > /run/systemd/network/10-rise-live.network <<-'EOF'
+	[Match]
+	Name=eth* en*
+	[Network]
+	DHCP=yes
+	IPv6AcceptRA=yes
+	EOF
+	systemctl restart systemd-networkd 2>/dev/null || true
+}
+
+# ---- the questions ------------------------------------------------------------------------
+
+ask_welcome() {
+	STEP=0
+	D "Welcome" --yes-label "Continue" --no-label "Shell" --yesno \
+"\n\Zb$TITLE\Zn  -  RISE Internet Security Environment\n\
+\Z3Silent by design. Secure by nature.\Zn\n\n\
+A server that runs SoftEther VPN and nothing else: L2TP/IPsec, OpenVPN,\n\
+SSTP and SoftEther clients, routed with NAT (full cone) and NAT66, with a\n\
+Let's Encrypt certificate and a WebGUI.\n\n\
+This installer \ZbERASES the disk\Zn you choose. Have ready:\n\
+  - the network settings of this server (or DHCP)\n\
+  - a domain name pointing at this server, for the certificate\n\
+  - passwords for the admin user, SoftEther and the WebGUI\n\n\
+Choose Shell for a root shell (type exit to come back)." 21 78 >/dev/null
+	if [ $? != 0 ]; then
+		clear; echo "Type 'exit' to return to the installer."; bash -l </dev/tty >/dev/tty 2>&1
+		return 1
+	fi
+}
+
+ask_disk() {
+	STEP=1
+	local skip items=() name
+	skip=" $(live_disk | tr '\n' ' ') "
+	for name in $(lsblk -dno NAME -e 1,7,11,251); do
+		[[ $skip == *" $name "* ]] && continue
+		[ "$(lsblk -dno TYPE "/dev/$name")" = disk ] || continue
+		[ "$(lsblk -dno RO "/dev/$name" | tr -d ' ')" = 0 ] || continue
+		case "$name" in zram*|ram*|loop*|sr*|fd*) continue ;; esac
+		items+=("/dev/$name" "$(printf '%-8s %-6s %s' "$(lsblk -dno SIZE "/dev/$name" | tr -d ' ')" \
+			"$(lsblk -dno TRAN "/dev/$name" | tr -d ' ')" "$(lsblk -dno MODEL "/dev/$name")")")
+	done
+	if [ ${#items[@]} = 0 ]; then
+		msg "Storage" "\nNo disk to install on was found.\n\nThe live medium itself is not offered." 10 60
+		return 1
+	fi
+	DISK=$(D "Storage" --menu "\nThe disk to install RISE Linux on. \ZbEverything on it will be erased.\Zn\n" \
+		16 78 6 "${items[@]}") || return 1
+}
+
+pick_wan() {
+	local ifs=() i
+	for i in /sys/class/net/*; do
+		i=${i##*/}
+		[ "$i" = lo ] && continue
+		[ -e "/sys/class/net/$i/device" ] || continue
+		ifs+=("$i" "$(cat /sys/class/net/$i/address) $(ip -4 -o addr show dev "$i" 2>/dev/null | awk '{print $4}' | head -n1)")
+	done
+	[ ${#ifs[@]} -gt 0 ] || { msg "Network" "\nNo network interface was found."; return 1; }
+	if [ ${#ifs[@]} = 2 ]; then
+		WAN_IF=${ifs[0]}
+	else
+		WAN_IF=$(D "Network" --default-item eth0 --menu "\nThe interface that faces the internet (WAN):\n" 15 70 6 "${ifs[@]}") || return 1
+	fi
+	WAN_MAC=$(cat "/sys/class/net/$WAN_IF/address")
+}
+
+ask_network() {
+	STEP=2
+	pick_wan || return 1
+	local cur4
+	cur4=$(ip -4 -o addr show dev "$WAN_IF" 2>/dev/null | awk '{print $4}' | head -n1)
+	NET4=$(D "Network: $WAN_IF IPv4" --default-item "${NET4:-dhcp}" --menu \
+		"\nIPv4 on $WAN_IF${cur4:+ (DHCP gave it $cur4 here)}:\n" 12 70 2 \
+		dhcp "DHCP" static "Static address") || return 1
+	if [ "$NET4" = static ]; then
+		while :; do
+			local out
+			out=$(D "Network: $WAN_IF IPv4" --form "\nStatic IPv4 of $WAN_IF:\n" 14 74 4 \
+				"Address/prefix:" 1 2 "${IP4:-${cur4:-}}" 1 22 40 43 \
+				"Gateway:" 2 2 "${GW4:-}" 2 22 40 15 \
+				"DNS servers:" 3 2 "${DNS4:-1.1.1.1 8.8.8.8}" 3 22 40 200) || return 1
+			{ read -r IP4; read -r GW4; read -r DNS4; } <<< "$out"
+			v4_iface "$IP4" || { msg "IPv4" "\n'$IP4' is not an address with a prefix (for example 203.0.113.10/24)."; continue; }
+			v4_addr "$GW4" || { msg "IPv4" "\n'$GW4' is not an IPv4 address."; continue; }
+			in_net "$GW4" "$IP4" || { msg "IPv4" "\nThe gateway $GW4 is not inside $IP4."; continue; }
+			dns_list_ok "$DNS4" && [ -n "$DNS4" ] || { msg "IPv4" "\nDNS servers: IP addresses separated by spaces."; continue; }
+			break
+		done
+	fi
+	NET6=$(D "Network: $WAN_IF IPv6" --default-item "${NET6:-auto}" --menu \
+		"\nIPv6 on $WAN_IF. The VPN's IPv6 (NAT66) leaves through this address.\n" 13 74 3 \
+		auto "Automatic (router advertisements and DHCPv6)" \
+		static "Static address" \
+		off "Disabled (no IPv6 for VPN clients either)") || return 1
+	if [ "$NET6" = static ]; then
+		while :; do
+			local out
+			out=$(D "Network: $WAN_IF IPv6" --form "\nStatic IPv6 of $WAN_IF:\n" 14 78 4 \
+				"Address/prefix:" 1 2 "${IP6:-}" 1 22 50 60 \
+				"Gateway:" 2 2 "${GW6:-}" 2 22 50 45 \
+				"DNS servers:" 3 2 "${DNS6:-}" 3 22 50 200) || return 1
+			{ read -r IP6; read -r GW6; read -r DNS6; } <<< "$out"
+			v6_iface "$IP6" || { msg "IPv6" "\n'$IP6' is not an IPv6 address with a prefix (2001:db8::10/64)."; continue; }
+			v6_addr "${GW6%%%*}" || { msg "IPv6" "\n'$GW6' is not an IPv6 address."; continue; }
+			[ -z "$DNS6" ] || dns_list_ok "$DNS6" || { msg "IPv6" "\nDNS servers: IP addresses separated by spaces."; continue; }
+			break
+		done
+	fi
+}
+
+ask_profile() {
+	STEP=3
+	while :; do
+		local out
+		out=$(D "Profile setup" --insecure --mixedform \
+"\nEnter the username and password (or ssh identity) you will use to log in\n\
+to the system. root cannot log in; this user has sudo.\n\n\
+Your server's name is the name it uses when it talks to other computers.\n\
+Import SSH identity: gh:<GitHub user> or lp:<Launchpad user>, or empty.\n" 21 78 8 \
+			"Your name:" 1 2 "${REALNAME:-}" 1 26 46 100 0 \
+			"Your server's name:" 2 2 "${HOSTNAME_NEW:-rise}" 2 26 46 63 0 \
+			"Pick a username:" 4 2 "${USERNAME:-}" 4 26 46 32 0 \
+			"Choose a password:" 5 2 "" 5 26 46 128 1 \
+			"Confirm your password:" 6 2 "" 6 26 46 128 1 \
+			"Import SSH identity:" 8 2 "${SSHID:-}" 8 26 46 80 0) || return 1
+		{ IFS= read -r REALNAME; IFS= read -r HOSTNAME_NEW; IFS= read -r USERNAME; IFS= read -r PW1; IFS= read -r PW2; IFS= read -r SSHID; } <<< "$out"
+		HOSTNAME_NEW=${HOSTNAME_NEW// /}; USERNAME=${USERNAME// /}; SSHID=${SSHID// /}
+		HOSTNAME_NEW=${HOSTNAME_NEW,,}
+		valid_hostname "$HOSTNAME_NEW" || { msg "Profile setup" "\nThe server's name: lowercase letters, digits and '-', up to 63."; continue; }
+		valid_user "$USERNAME" || { msg "Profile setup" "\nThe username: lowercase, starting with a letter, not root and not an\nexisting system user."; continue; }
+		[ ${#PW1} -ge 6 ] || { msg "Profile setup" "\nThe password needs at least 6 characters."; continue; }
+		[ "$PW1" = "$PW2" ] || { msg "Profile setup" "\nThe passwords do not match."; continue; }
+		if [ -n "$SSHID" ] && ! [[ $SSHID =~ ^(gh|lp):[A-Za-z0-9._-]+$ ]]; then
+			msg "Profile setup" "\nSSH identity: gh:<user> or lp:<user>."; continue
+		fi
+		USERPW=$PW1
+		break
+	done
+}
+
+ask_domain() {
+	STEP=4
+	while :; do
+		local out
+		out=$(D "VPN domain" --form \
+"\nThe domain name of this VPN server. It must already point at this server\n\
+(A and/or AAAA record): Let's Encrypt checks it over HTTP on port 80.\n\
+The same name serves the WebGUI over HTTPS.\n\n\
+The certificate renews by itself and is loaded into SoftEther live.\n" 18 78 2 \
+			"Domain name:" 1 2 "${VPN_DOMAIN:-}" 1 20 52 253 \
+			"E-mail (optional):" 2 2 "${ACME_EMAIL:-}" 2 20 52 254) || return 1
+		{ read -r VPN_DOMAIN; read -r ACME_EMAIL; } <<< "$out"
+		VPN_DOMAIN=${VPN_DOMAIN,,}
+		valid_fqdn "$VPN_DOMAIN" || { msg "VPN domain" "\n'$VPN_DOMAIN' is not a domain name (vpn.example.com)."; continue; }
+		if [ "$VPN_DOMAIN" = "$HOSTNAME_NEW" ]; then
+			msg "VPN domain" "\nThe domain is the public name; the server's name ($HOSTNAME_NEW) is its\nown hostname. Use a full domain such as vpn.example.com."; continue
+		fi
+		[ -z "$ACME_EMAIL" ] || [[ $ACME_EMAIL =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || \
+			{ msg "VPN domain" "\nThe e-mail address does not look right."; continue; }
+		yesno "Let's Encrypt" "\nThe certificate comes from Let's Encrypt. Requesting it means agreeing to\n\
+the Let's Encrypt Subscriber Agreement:\n\
+  https://letsencrypt.org/repository/\n\nDo you agree?" 12 78 || continue
+		break
+	done
+}
+
+ask_vpnnet() {
+	STEP=5
+	local choice
+	choice=$(D "VPN network" --default-item "${VPNNET_MODE:-default}" --menu \
+"\nThe network of the VPN clients, on SoftEther's TAP interface (tap_vpn):\n" 13 78 2 \
+		default "IPv4 10.255.255.1/24, IPv6 fd00:255::1/64" \
+		custom "Choose the addresses") || return 1
+	VPNNET_MODE=$choice
+	VPN_IPV4=${VPN_IPV4:-10.255.255.1/24}; VPN_DHCP_START=${VPN_DHCP_START:-10.255.255.2}
+	VPN_DHCP_END=${VPN_DHCP_END:-10.255.255.254}; VPN_IPV6=${VPN_IPV6:-fd00:255::1/64}
+	if [ "$choice" = custom ]; then
+		while :; do
+			local out
+			out=$(D "VPN network" --form "\nThe gateway is this server's address on the VPN side.\n" 15 76 4 \
+				"IPv4 gateway/prefix:" 1 2 "$VPN_IPV4" 1 24 44 43 \
+				"DHCP first address:" 2 2 "$VPN_DHCP_START" 2 24 44 15 \
+				"DHCP last address:" 3 2 "$VPN_DHCP_END" 3 24 44 15 \
+				"IPv6 gateway/prefix:" 4 2 "$VPN_IPV6" 4 24 44 60) || return 1
+			{ read -r VPN_IPV4; read -r VPN_DHCP_START; read -r VPN_DHCP_END; read -r VPN_IPV6; } <<< "$out"
+			v4_iface "$VPN_IPV4" || { msg "VPN network" "\nIPv4: an address with a prefix, such as 10.255.255.1/24."; continue; }
+			in_net "$VPN_DHCP_START" "$VPN_IPV4" && in_net "$VPN_DHCP_END" "$VPN_IPV4" || \
+				{ msg "VPN network" "\nThe DHCP range must be inside $VPN_IPV4."; continue; }
+			py 'assert ipaddress.ip_address(sys.argv[1]) <= ipaddress.ip_address(sys.argv[2])' "$VPN_DHCP_START" "$VPN_DHCP_END" || \
+				{ msg "VPN network" "\nThe first DHCP address comes after the last one."; continue; }
+			py 'i=ipaddress.ip_interface(sys.argv[1]); a,b=map(ipaddress.ip_address,sys.argv[2:]); assert not (a<=i.ip<=b)' \
+				"$VPN_IPV4" "$VPN_DHCP_START" "$VPN_DHCP_END" || \
+				{ msg "VPN network" "\nThe gateway address is inside the DHCP range."; continue; }
+			v6_iface "$VPN_IPV6" || { msg "VPN network" "\nIPv6: an address with a prefix, such as fd00:255::1/64."; continue; }
+			[ -n "${IP4:-}" ] && in_net "${IP4%/*}" "$VPN_IPV4" && { msg "VPN network" "\n$VPN_IPV4 overlaps the WAN address $IP4."; continue; }
+			break
+		done
+	fi
+	if yesno "VPN network" \
+"\nGive VPN clients a /32 address with proxy-ARP? (recommended)\n\n\
+Each client then reaches everything, other clients included, through this\n\
+server, where the firewall decides. The IPv6 prefix is advertised off-link\n\
+the same way. With No, clients share a normal /${VPN_IPV4#*/} subnet." 14 78; then
+		VPN_PROXY_ARP=1
+	else
+		VPN_PROXY_ARP=0
+	fi
+	if yesno "VPN network" "\nIsolate VPN clients from each other? (recommended)\n\nThey still reach the internet; only client-to-client traffic is blocked." 11 78; then
+		VPN_ISOLATION=1
+	else
+		VPN_ISOLATION=0
+	fi
+}
+
+ask_softether() {
+	STEP=6
+	SE_PSK=${SE_PSK:-$(rand 12)}
+	while :; do
+		local out
+		out=$(D "SoftEther VPN" --insecure --mixedform \
+"\nThe server administrator password is what SoftEther VPN Server Manager\n\
+(and vpncmd) asks for. The IPsec pre-shared key is for L2TP/IPsec clients.\n\
+A first VPN user is optional: add users later in Server Manager.\n" 19 78 6 \
+			"Admin password:" 1 2 "" 1 24 46 128 1 \
+			"Confirm:" 2 2 "" 2 24 46 128 1 \
+			"IPsec pre-shared key:" 4 2 "$SE_PSK" 4 24 46 64 0 \
+			"VPN user (optional):" 6 2 "${VPN_USER:-}" 6 24 46 63 0 \
+			"VPN user password:" 7 2 "" 7 24 46 128 1) || return 1
+		local a b
+		{ IFS= read -r a; IFS= read -r b; IFS= read -r SE_PSK; IFS= read -r VPN_USER; IFS= read -r VPN_USERPW; } <<< "$out"
+		VPN_USER=${VPN_USER// /}
+		[ ${#a} -ge 8 ] || { msg "SoftEther VPN" "\nThe admin password needs at least 8 characters."; continue; }
+		[ "$a" = "$b" ] || { msg "SoftEther VPN" "\nThe admin passwords do not match."; continue; }
+		[[ $SE_PSK =~ ^[A-Za-z0-9._@%+=-]{4,64}$ ]] || { msg "SoftEther VPN" "\nThe pre-shared key: 4 to 64 letters, digits or ._@%+=-"; continue; }
+		if [ -n "$VPN_USER" ]; then
+			valid_vpnuser "$VPN_USER" || { msg "SoftEther VPN" "\nThe VPN user name: letters, digits and ._-"; continue; }
+			[ -n "$VPN_USERPW" ] || { msg "SoftEther VPN" "\nThe VPN user needs a password."; continue; }
+		fi
+		SE_ADMINPW=$a
+		break
+	done
+}
+
+ask_webgui() {
+	STEP=7
+	while :; do
+		local out
+		out=$(D "WebGUI" --insecure --mixedform \
+"\nThe WebGUI: https://$VPN_DOMAIN:18080 (from the WAN side only; VPN clients\n\
+cannot reach this server). It has its own login.\n" 15 78 4 \
+			"Username:" 1 2 "${WEB_USER:-admin}" 1 20 46 32 0 \
+			"Password:" 2 2 "" 2 20 46 128 1 \
+			"Confirm:" 3 2 "" 3 20 46 128 1) || return 1
+		local b
+		{ IFS= read -r WEB_USER; IFS= read -r WEB_PW; IFS= read -r b; } <<< "$out"
+		WEB_USER=${WEB_USER// /}
+		[[ $WEB_USER =~ ^[A-Za-z0-9._-]{1,32}$ ]] || { msg "WebGUI" "\nThe username: letters, digits and ._-"; continue; }
+		[ ${#WEB_PW} -ge 8 ] || { msg "WebGUI" "\nThe password needs at least 8 characters."; continue; }
+		[ "$WEB_PW" = "$b" ] || { msg "WebGUI" "\nThe passwords do not match."; continue; }
+		if [ "$WEB_PW" = "$USERPW" ] || [ "$WEB_PW" = "$SE_ADMINPW" ]; then
+			local same="the sudo user's password"
+			[ "$WEB_PW" = "$SE_ADMINPW" ] && same="the SoftEther admin password"
+			[ "$WEB_USER" = "$USERNAME" ] && [ "$WEB_PW" = "$USERPW" ] && same="the sudo user's name and password"
+			yesno "WebGUI" "\n\Z1Warning:\Zn the WebGUI login is the same as $same.\n\n\
+Whoever learns one then has both. Use it anyway?" 11 74 || continue
+		fi
+		break
+	done
+}
+
+port_note() {
+	local a=${IP4%/*}
+	[ "$NET4" = dhcp ] && a=$(ip -4 -o addr show dev "$WAN_IF" 2>/dev/null | awk '{print $4}' | head -n1) && a=${a%/*}
+	[ -n "$a" ] && is_private4 "$a" || return 0
+	echo "\n\Z3Note:\Zn $a is a private address: this server is behind NAT. Forward these\n\
+ports from the router to it:\n\
+  TCP 80 (Let's Encrypt), 443, 992, 1194, 5555 (SoftEther), 9122 (SSH),\n\
+      18080 (WebGUI)\n\
+  UDP 500, 4500 (L2TP/IPsec), 1194 (OpenVPN), and 1024-65535 for UDP\n\
+      acceleration (or as many as the router allows)\n"
+}
+
+summary() {
+	STEP=8
+	local n4 n6
+	if [ "$NET4" = dhcp ]; then n4="DHCP"; else n4="$IP4 via $GW4, DNS $DNS4"; fi
+	case "$NET6" in auto) n6="automatic" ;; off) n6="disabled" ;; *) n6="$IP6 via $GW6" ;; esac
+	D "Summary" --yes-label "Install" --no-label "Back" --yesno \
+"\n\
+  Disk            \Zb$DISK\Zn  (\Z1erased\Zn)  $(lsblk -dno SIZE,MODEL "$DISK" 2>/dev/null)\n\
+  Server name     $HOSTNAME_NEW\n\
+  User (sudo)     $USERNAME${SSHID:+  + keys of $SSHID}\n\
+  WAN             $WAN_IF  IPv4 $n4\n\
+                          IPv6 $n6\n\
+  VPN domain      $VPN_DOMAIN  (Let's Encrypt${ACME_EMAIL:+, $ACME_EMAIL})\n\
+  VPN network     $VPN_IPV4  DHCP $VPN_DHCP_START - $VPN_DHCP_END\n\
+                  $([ "$NET6" = off ] && echo "no IPv6" || echo "$VPN_IPV6 (NAT66)")\n\
+  Clients         $([ "$VPN_PROXY_ARP" = 1 ] && echo "/32 with proxy-ARP" || echo "shared subnet"), $([ "$VPN_ISOLATION" = 1 ] && echo isolated || echo "can reach each other")\n\
+  SoftEther       IPsec key $SE_PSK${VPN_USER:+, first user $VPN_USER}\n\
+  WebGUI          https://$VPN_DOMAIN:18080  ($WEB_USER)\n\
+  SSH             port 9122, no root login\n\
+$(port_note)" 30 82 >/dev/null
+}
+
+# ---- the install ---------------------------------------------------------------------------
+
+part() { case "$1" in *[0-9]) echo "${1}p$2" ;; *) echo "$1$2" ;; esac; }
+run() { echo "+ $*" >&2; "$@" >&2; }
+in_target() { chroot "$TARGET" /usr/bin/env -i HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive "$@"; }
+progress() { printf 'XXX\n%d\n%s\nXXX\n' "$1" "$2"; }
+
+FAILED=
+fail() { FAILED=$1; echo "!! $1" >&2; }
+
+write_netplan() {
+	local f=$TARGET/etc/netplan/50-rise.yaml
+	{
+		echo "# written by the RISE installer; the WebGUI edits it"
+		echo "network:"
+		echo "  version: 2"
+		echo "  renderer: networkd"
+		echo "  ethernets:"
+		echo "    $WAN_IF:"
+		echo "      match:"
+		echo "        macaddress: \"$WAN_MAC\""
+		echo "      set-name: $WAN_IF"
+		if [ "$NET4" = dhcp ]; then echo "      dhcp4: true"; else echo "      dhcp4: false"; fi
+		case "$NET6" in
+		auto) echo "      dhcp6: true"; echo "      accept-ra: true" ;;
+		static) echo "      dhcp6: false"; echo "      accept-ra: false" ;;
+		off) echo "      dhcp6: false"; echo "      accept-ra: false"; echo "      link-local: [ ipv4 ]" ;;
+		esac
+		local addrs=() routes=() dns=()
+		[ "$NET4" = static ] && { addrs+=("$IP4"); routes+=("$GW4"); dns+=($DNS4); }
+		[ "$NET6" = static ] && { addrs+=("$IP6"); routes+=("$GW6"); dns+=(${DNS6:-}); }
+		if [ ${#addrs[@]} -gt 0 ]; then
+			echo "      addresses:"; local a; for a in "${addrs[@]}"; do echo "        - \"$a\""; done
+			echo "      routes:"; for a in "${routes[@]}"; do echo "        - to: default"; echo "          via: \"$a\""; done
+		fi
+		if [ ${#dns[@]} -gt 0 ]; then
+			echo "      nameservers:"; echo "        addresses:"
+			local a; for a in "${dns[@]}"; do echo "          - \"$a\""; done
+		fi
+	} > "$f"
+	chmod 600 "$f"
+}
+
+write_conf() {
+	local conf=$TARGET/etc/rise/rise.conf
+	cp "$TARGET/etc/rise/rise.conf.default" "$conf"
+	chmod 644 "$conf"
+	local v6=1
+	[ "$NET6" = off ] && v6=0
+	RISE_CONF=$conf RISE_DEFAULTS=$TARGET/etc/rise/rise.conf.default bash -c '
+		. /usr/lib/rise/common.sh
+		conf_set WAN_IF "$1"; conf_set VPN_DOMAIN "$2"; conf_set ACME_EMAIL "$3"
+		conf_set VPN_IPV4 "$4"; conf_set VPN_DHCP_START "$5"; conf_set VPN_DHCP_END "$6"
+		conf_set VPN_IPV6 "$7"; conf_set VPN_IPV6_ENABLE "$8"; conf_set NAT66 "$8"
+		conf_set VPN_PROXY_ARP "$9"; conf_set VPN_ISOLATION "${10}"
+		[ -n "${11}" ] && conf_set VPN_DNS4 "${11}"
+		' _ "$WAN_IF" "$VPN_DOMAIN" "$ACME_EMAIL" "$VPN_IPV4" "$VPN_DHCP_START" "$VPN_DHCP_END" \
+		"$VPN_IPV6" "$v6" "$VPN_PROXY_ARP" "$VPN_ISOLATION" "" >&2
+}
+
+write_secrets() {
+	local s=$TARGET/etc/rise/secrets
+	install -d -m 0700 "$s"
+	( umask 077
+	  printf '%s\n' "$SE_ADMINPW" > "$s/softether-admin"
+	  printf '%s\n' "$SE_PSK" > "$s/ipsec-psk"
+	  [ -n "$VPN_USER" ] && printf '%s:%s\n' "$VPN_USER" "$VPN_USERPW" > "$s/vpn-first-user"
+	)
+	printf '%s' "$WEB_PW" | in_target python3 -I /usr/share/rise/webgui/server.py --set-password "$WEB_USER" >&2
+	# a self-signed certificate for the WebGUI until Let's Encrypt has one
+	in_target openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+		-subj "/CN=$VPN_DOMAIN" -addext "subjectAltName=DNS:$VPN_DOMAIN,DNS:$HOSTNAME_NEW" \
+		-keyout /etc/rise/secrets/webgui-selfsigned.key -out /etc/rise/secrets/webgui-selfsigned.crt >&2 2>&1
+	chmod 600 "$s"/*
+}
+
+do_install() {
+	local sq=$1 esp root
+	progress 2 "Partitioning $DISK"
+	swapoff -a 2>/dev/null
+	umount -R "$TARGET" 2>/dev/null
+	for p in $(lsblk -lnpo NAME "$DISK" | tail -n +2); do umount "$p" 2>/dev/null; done
+	run wipefs -af "$DISK" || { fail "wipefs $DISK"; return; }
+	run sgdisk -Z "$DISK"
+	# BIOS boot + EFI system + root: the disk boots in either firmware mode
+	run sgdisk -n1:1M:+1M -t1:EF02 -c1:bios -n2:0:+512M -t2:EF00 -c2:EFI -n3:0:0 -t3:8304 -c3:rise-root "$DISK" ||
+		{ fail "partitioning $DISK"; return; }
+	run partprobe "$DISK"; udevadm settle; sleep 1
+	esp=$(part "$DISK" 2); root=$(part "$DISK" 3)
+	progress 5 "Formatting"
+	run mkfs.vfat -F 32 -n EFI "$esp" || { fail "mkfs.vfat $esp"; return; }
+	run mkfs.ext4 -F -q -L rise-root "$root" || { fail "mkfs.ext4 $root"; return; }
+	mkdir -p "$TARGET"
+	run mount "$root" "$TARGET" || { fail "mount $root"; return; }
+	mkdir -p "$TARGET/boot/efi"
+	run mount "$esp" "$TARGET/boot/efi" || { fail "mount $esp"; return; }
+
+	progress 8 "Copying the system"
+	local pc
+	unsquashfs -f -percentage -d "$TARGET" "$sq" 2>>"$LOG" | while read -r pc; do
+		[[ $pc =~ ^[0-9]+$ ]] && progress $(( 8 + pc * 62 / 100 )) "Copying the system ($pc%)"
+	done
+	[ -x "$TARGET/usr/lib/rise/banner" ] || { fail "copying the system from $sq"; return; }
+
+	progress 72 "Configuring"
+	for m in dev dev/pts proc sys run; do mount --bind "/$m" "$TARGET/$m"; done
+	[ -d /sys/firmware/efi/efivars ] && mount --bind /sys/firmware/efi/efivars "$TARGET/sys/firmware/efi/efivars" 2>/dev/null
+	cat > "$TARGET/etc/fstab" <<-EOF
+	# <file system>                           <mount point> <type> <options>          <dump> <pass>
+	UUID=$(blkid -s UUID -o value "$root")  /          ext4   errors=remount-ro  0 1
+	UUID=$(blkid -s UUID -o value "$esp")                       /boot/efi  vfat   umask=0077         0 1
+	EOF
+	echo "$HOSTNAME_NEW" > "$TARGET/etc/hostname"
+	cat > "$TARGET/etc/hosts" <<-EOF
+	127.0.0.1 localhost
+	127.0.1.1 $HOSTNAME_NEW
+	::1 localhost ip6-localhost ip6-loopback
+	ff02::1 ip6-allnodes
+	ff02::2 ip6-allrouters
+	EOF
+	run systemd-machine-id-setup --root="$TARGET"
+	in_target ssh-keygen -A >&2
+	write_netplan
+	write_conf
+	write_secrets
+	touch "$TARGET/var/lib/rise/firstboot-pending"
+
+	progress 78 "Creating $USERNAME"
+	in_target useradd -m -s /bin/bash -c "$REALNAME" -G sudo,adm "$USERNAME" >&2 || { fail "useradd $USERNAME"; return; }
+	printf '%s:%s\n' "$USERNAME" "$USERPW" | in_target chpasswd >&2 || { fail "password of $USERNAME"; return; }
+	if [ -n "$SSHID" ]; then
+		local home=$TARGET/home/$USERNAME
+		install -d -m 700 "$home/.ssh"
+		if ssh-import-id -o "$home/.ssh/authorized_keys" "$SSHID" >&2 2>&1; then
+			in_target chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.ssh"
+		else
+			echo "ssh-import-id $SSHID failed (no network?)" >&2
+			echo "$SSHID" > "$TARGET/var/lib/rise/ssh-import-id-pending"
+		fi
+	fi
+
+	progress 82 "Removing the live system"
+	in_target apt-get purge -y casper >&2 || true
+	rm -f "$TARGET/etc/systemd/system/getty@tty1.service.d/rise.conf"
+	progress 86 "Building the initramfs"
+	in_target update-initramfs -c -k all >&2 2>&1 || in_target update-initramfs -u -k all >&2 2>&1
+
+	progress 92 "Installing GRUB (BIOS and UEFI)"
+	in_target grub-install --target=i386-pc "$DISK" >&2 2>&1 || echo "BIOS GRUB failed" >&2
+	if [ -d /sys/firmware/efi ]; then
+		in_target grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=rise >&2 2>&1 ||
+			echo "UEFI GRUB (NVRAM entry) failed" >&2
+	fi
+	in_target grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-nvram >&2 2>&1 ||
+		echo "UEFI GRUB (removable path) failed" >&2
+	in_target update-grub >&2 2>&1 || { fail "update-grub"; return; }
+	[ -e "$TARGET/boot/grub/grub.cfg" ] || { fail "no grub.cfg"; return; }
+
+	progress 98 "Finishing"
+	cp "$LOG" "$TARGET/var/log/rise-installer.log" 2>/dev/null
+	# the installer's log holds no passwords; keep it root-only anyway
+	chmod 600 "$TARGET/var/log/rise-installer.log" 2>/dev/null
+	sync
+	progress 100 "Done"
+}
+
+unmount_target() {
+	umount -R "$TARGET" 2>/dev/null || umount -lR "$TARGET" 2>/dev/null
+}
+
+install() {
+	local sq
+	sq=$(find_squashfs) || { msg "Install" "\nThe system image (casper/filesystem.squashfs) was not found on the\ninstallation medium."; return 1; }
+	STEP=8
+	local start
+	start=$(wc -l < "$LOG")
+	do_install "$sq" 2>>"$LOG" | dialog --backtitle "$(bt "Installing")" --title " Installing " \
+		--no-shadow --gauge "\nInstalling RISE Linux on $DISK" 10 74 0 >/dev/tty
+	unmount_target
+	FAILED=$(tail -n +$(( start + 1 )) "$LOG" | grep -m1 '^!! ' | cut -c4-)
+	if [ -n "$FAILED" ]; then
+		D "Install failed" --msgbox "\nThe install stopped at: \Z1$FAILED\Zn\n\nThe last lines of $LOG:\n\n$(tail -n 8 "$LOG" | cut -c1-72)" 22 80 >/dev/null
+		return 1
+	fi
+	return 0
+}
+
+finish() {
+	D "Install complete" --yes-label "Reboot" --no-label "Shell" --yesno \
+"\n\ZbRISE Linux is installed.\Zn\n\n\
+Remove the installation medium, then reboot.\n\n\
+At the first boot SoftEther is configured and the certificate of\n\
+$VPN_DOMAIN is requested (port 80 must reach this server).\n\n\
+  WebGUI   https://$VPN_DOMAIN:18080\n\
+  SSH      ssh -p 9122 $USERNAME@$VPN_DOMAIN\n\
+  VPN      SoftEther Server Manager: $VPN_DOMAIN, port 443 or 5555\n\n\
+\Z3Silent by design. Secure by nature.\Zn" 20 76 >/dev/null
+	if [ $? = 0 ]; then
+		eject -m /cdrom >/dev/null 2>&1 || true
+		systemctl reboot
+		sleep 30
+	fi
+	clear; bash -l </dev/tty >/dev/tty 2>&1
+}
+
+main() {
+	palette
+	live_network
+	ask_welcome || return
+	local s=disk
+	# Back (Esc / Cancel) on a page returns to the page before it
+	while :; do
+		case $s in
+		disk) ask_disk && s=network || return ;;
+		network) ask_network && s=profile || s=disk ;;
+		profile) ask_profile && s=domain || s=network ;;
+		domain) ask_domain && s=vpnnet || s=profile ;;
+		vpnnet) ask_vpnnet && s=softether || s=domain ;;
+		softether) ask_softether && s=webgui || s=vpnnet ;;
+		webgui) ask_webgui && s=summary || s=softether ;;
+		summary) summary && s=install || s=webgui ;;
+		install) if install; then finish; return; else s=summary; fi ;;
+		esac
+	done
+}
+
+while :; do
+	main
+	# the installer only leaves through a reboot; anything else starts it again
+	sleep 1
+done

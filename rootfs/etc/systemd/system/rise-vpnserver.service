@@ -1,0 +1,21 @@
+[Unit]
+Description=SoftEther VPN Server
+After=network-online.target rise-firewall.service
+Wants=network-online.target rise-firewall.service
+ConditionPathExists=/etc/rise/rise.conf
+ConditionKernelCommandLine=!boot=casper
+
+[Service]
+Type=exec
+ExecStart=/opt/softether/libexec/softether/vpnserver/vpnserver execsvc
+ExecStopPost=-/usr/lib/rise/vpn-net down
+Restart=on-failure
+RestartSec=3
+Nice=-10
+TasksMax=infinity
+LimitNOFILE=1048576
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

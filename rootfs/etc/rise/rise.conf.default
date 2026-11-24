@@ -1,0 +1,65 @@
+# /etc/rise/rise.conf -- RISE Linux settings. The installer writes this file
+# and the WebGUI edits it; after a manual edit run:  sudo rise apply
+# Shell syntax: KEY="value", one per line.
+
+# ---- this server ----------------------------------------------------------------
+WAN_IF="eth0"
+SSH_PORT="9122"
+WEBGUI_PORT="18080"
+# console: GRUB and kernel mode (1024x768, 1280x720, 1920x1080, 2560x1440,
+# 3840x2160 or native); the font doubles on wide screens (auto, 1, 2)
+CONSOLE_MODE="1024x768"
+CONSOLE_FONT_SCALE="auto"
+# the login screen on tty1 refreshes its IP and speed lines (seconds, 0 = off)
+ISSUE_REFRESH="10"
+
+# ---- VPN ------------------------------------------------------------------------
+# the public name of the VPN, also the Let's Encrypt certificate and the
+# WebGUI address (https://VPN_DOMAIN:WEBGUI_PORT)
+VPN_DOMAIN=""
+ACME_EMAIL=""
+VPN_HUB="VPN"
+# SoftEther local bridge device: the interface is tap_<VPN_TAP>
+VPN_TAP="vpn"   # fixed: the udev rule and rise-vpn-net.service name tap_vpn
+
+VPN_IPV4="10.255.255.1/24"
+VPN_DHCP_START="10.255.255.2"
+VPN_DHCP_END="10.255.255.254"
+VPN_DHCP_LEASE="12h"
+VPN_DNS4="1.1.1.1 8.8.8.8"
+
+VPN_IPV6_ENABLE="1"
+VPN_IPV6="fd00:255::1/64"
+VPN_DNS6="2606:4700:4700::1111 2001:4860:4860::8888"
+
+# proxy-ARP: clients get a /32 address and reach everything through
+# VPN_IPV4's address; the IPv6 prefix is advertised off-link the same way
+VPN_PROXY_ARP="1"
+# isolation: clients cannot reach one another (also enforced on the hub)
+VPN_ISOLATION="1"
+# MTU of the VPN side. 1350 fits the largest overhead SoftEther carries
+# (L2TP/IPsec NAT-T over IPv6 over PPPoE); see README "MTU".
+VPN_MTU="1350"
+# VPN clients may ping the gateway address (nothing else on this server)
+VPN_ALLOW_PING="1"
+# VPN clients may not reach private networks beside this server (RFC 1918,
+# CGNAT, ULA); their internet access is unchanged
+VPN_BLOCK_LAN="0"
+
+# ---- NAT --------------------------------------------------------------------------
+# full cone (endpoint-independent) NAT with xt_FULLCONENAT; falls back to
+# MASQUERADE when the module is missing
+NAT_FULLCONE="1"
+# NAT66: the VPN's ULA prefix leaves through WAN_IF's global IPv6 address
+NAT66="1"
+# external ports full cone mappings use (local services stay below 10000)
+NAT_PORT_RANGE="10000-32767"
+
+# ---- SoftEther --------------------------------------------------------------------
+SOFTETHER_TCP_PORTS="443 992 1194 5555"
+SOFTETHER_UDP_PORTS="500 4500 1194"
+# UDP acceleration and NAT-T use random high UDP ports
+SOFTETHER_UDP_ACCEL="1"
+# VPN over DNS (udp/53) and over ICMP
+SOFTETHER_VPN_OVER_DNS="1"
+SOFTETHER_VPN_OVER_ICMP="1"

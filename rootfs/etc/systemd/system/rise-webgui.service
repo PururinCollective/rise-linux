@@ -1,0 +1,15 @@
+[Unit]
+Description=RISE WebGUI (HTTPS)
+After=network-online.target rise-vpnserver.service
+Wants=network-online.target
+ConditionPathExists=/etc/rise/rise.conf
+ConditionKernelCommandLine=!boot=casper
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/share/rise/webgui/server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

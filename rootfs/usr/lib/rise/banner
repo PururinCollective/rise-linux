@@ -1,0 +1,307 @@
+#!/bin/bash
+# banner splash|issue|login|print -- the RISE Linux banner, centered.
+#
+#   splash  the boot screen on tty1: the logo wipes in, the tagline whispers
+#           itself, the rules open from the middle, then the live lines
+#           (waits a few seconds for an address). Centered both ways.
+#   issue   /etc/issue for the tty1 login: the banner centered to tty1's width
+#           with the current addresses and speed; asks agetty to redraw when
+#           it changed (rise-issue.timer, every ISSUE_REFRESH seconds)
+#   login   the banner for an interactive login shell: a short wipe on ssh,
+#           at once on the console
+#   print   the banner once, no animation (for scripts and testing)
+#
+# RISE_COLOR=none|16|256|truecolor and RISE_COLS/RISE_ROWS override detection.
+. "${RISE_LIB:-/usr/lib/rise}/common.sh" 2>/dev/null || true
+
+LOGO_FILE=${RISE_SHARE:-/usr/share/rise}/logo.txt
+TAG1="RISE Internet Security Environment"
+TAG2="by Pururin Collective"
+WHISPER="Silent by design. Secure by nature."
+W=67
+
+mapfile -t LOGO < "$LOGO_FILE" 2>/dev/null || LOGO=("RISE Linux")
+
+# ---- colours ---------------------------------------------------------------------
+
+color_mode() {
+	case "${RISE_COLOR:-}" in none|16|256|truecolor) echo "$RISE_COLOR"; return ;; esac
+	case "${COLORTERM:-}" in truecolor|24bit) echo truecolor; return ;; esac
+	case "${TERM:-}" in
+	''|dumb) echo none ;;
+	linux) echo 16 ;;
+	*256color*|*direct*|xterm-kitty|alacritty*|foot*|wezterm*) echo 256 ;;
+	*) echo 16 ;;
+	esac
+}
+
+set_colors() {
+	E=$'\e'
+	case "$1" in
+	none) C_ORANGE='' C_WHITE='' C_DIM='' C_RULE='' C_LABEL='' C_VAL='' C_HOT='' C_0='' ;;
+	16)
+		# on the Linux console, palette slot 3 (brown) is set to Ubuntu orange
+		C_ORANGE="${E}[0;33m" C_WHITE="${E}[1;37m" C_DIM="${E}[0;90m" C_RULE="${E}[0;90m"
+		C_LABEL="${E}[0;36m" C_VAL="${E}[0;37m" C_HOT="${E}[1;33m" C_0="${E}[0m" ;;
+	256)
+		C_ORANGE="${E}[38;5;202m" C_WHITE="${E}[1;38;5;255m" C_DIM="${E}[38;5;244m" C_RULE="${E}[38;5;240m"
+		C_LABEL="${E}[38;5;110m" C_VAL="${E}[38;5;252m" C_HOT="${E}[1;38;5;214m" C_0="${E}[0m" ;;
+	truecolor)
+		C_ORANGE="${E}[38;2;233;84;32m" C_WHITE="${E}[1;38;2;245;245;245m" C_DIM="${E}[38;2;140;140;140m"
+		C_RULE="${E}[38;2;90;90;90m" C_LABEL="${E}[38;2;120;170;220m" C_VAL="${E}[38;2;220;220;220m"
+		C_HOT="${E}[1;38;2;255;170;60m" C_0="${E}[0m" ;;
+	esac
+}
+
+# Ubuntu-orange palette on a Linux console (the installer's look)
+console_palette() {
+	[ "${TERM:-}" = linux ] || return 0
+	printf '\e]P0111111\e]P3E95420\e]P7CCCCCC\e]P8555555\e]PBF0A050'
+}
+
+# ---- data ------------------------------------------------------------------------
+
+human_rate() {
+	# bits per second, three significant figures
+	awk -v b="${1:-0}" 'BEGIN {
+		split("bps Kbps Mbps Gbps Tbps", u, " "); i = 1
+		while (b >= 1000 && i < 5) { b /= 1000; i++ }
+		printf (b >= 100 || i == 1) ? "%.0f %s" : (b >= 10 ? "%.1f %s" : "%.2f %s"), b, u[i]
+	}'
+}
+
+collect() {
+	. /etc/os-release 2>/dev/null
+	HOST=$(hostname 2>/dev/null || cat /etc/hostname)
+	OSVER=${PRETTY_NAME:-Ubuntu}
+	KVER=$(uname -r)
+	IP4=$(wan_addr 4 2>/dev/null); IP4=${IP4%/*}
+	IP6=$(wan_addr 6 2>/dev/null); IP6=${IP6%/*}
+	RX=; TX=
+	if [ -r "$RISE_RUN/rates.sh" ]; then
+		# shellcheck disable=SC1091
+		. "$RISE_RUN/rates.sh"
+		RX=$(human_rate "${WAN_RX_BPS:-0}"); TX=$(human_rate "${WAN_TX_BPS:-0}")
+	fi
+}
+
+info_line1() { printf '%s | %s | %s' "$HOST" "$OSVER" "$KVER"; }
+info_line2() {
+	printf '%s | %s | TX %s RX %s' "${IP4:-no IPv4}" "${IP6:-no IPv6}" "${TX:--}" "${RX:--}"
+}
+# the same, coloured
+info_line1_c() {
+	printf '%s%s%s %s|%s %s%s%s %s|%s %s%s%s' "$C_WHITE" "$HOST" "$C_0" "$C_RULE" "$C_0" \
+		"$C_VAL" "$OSVER" "$C_0" "$C_RULE" "$C_0" "$C_VAL" "$KVER" "$C_0"
+}
+info_line2_c() {
+	printf '%s%s%s %s|%s %s%s%s %s|%s %sTX%s %s %sRX%s %s' \
+		"$C_VAL" "${IP4:-no IPv4}" "$C_0" "$C_RULE" "$C_0" "$C_VAL" "${IP6:-no IPv6}" "$C_0" \
+		"$C_RULE" "$C_0" "$C_LABEL" "$C_0" "${TX:--}" "$C_LABEL" "$C_0" "${RX:--}"
+}
+
+# ---- layout ------------------------------------------------------------------------
+
+term_size() {
+	local s=
+	# the terminal on stdout: the splash runs with stdin on /dev/null. fd 4
+	# is stdout as it is here, before the command substitution replaces it.
+	{ s=$(stty size <&4 2>/dev/null); } 4>&1
+	[ -n "$s" ] || s=$(stty size 2>/dev/null) || s=
+	ROWS=${RISE_ROWS:-${s% *}}; COLS=${RISE_COLS:-${s#* }}
+	case "$ROWS" in ''|0|*[!0-9]*) ROWS=24 ;; esac
+	case "$COLS" in ''|0|*[!0-9]*) COLS=80 ;; esac
+}
+
+# spaces to put a block of width $1 in the middle of the screen
+lpad() { local p=$(( (COLS - $1) / 2 )); [ $p -lt 0 ] && p=0; printf '%*s' "$p" ''; }
+rule() { local w=$1 s; printf -v s '%*s' "$w" ''; printf '%s' "${s// /-}"; }
+
+# the block width: the logo, or a longer info line
+block_width() {
+	local a b
+	a=$(info_line1); b=$(info_line2)
+	BW=$W
+	[ $(( ${#a} + 2 )) -gt $BW ] && BW=$(( ${#a} + 2 ))
+	[ $(( ${#b} + 2 )) -gt $BW ] && BW=$(( ${#b} + 2 ))
+}
+
+# a line of visible width $2 centered inside the block
+in_block() {
+	local s=$1 w=$2 p
+	p=$(( (BW - w) / 2 ))
+	printf '%*s%s' "$p" '' "$s"
+}
+
+# the whole banner, static
+render() {
+	local pad i a b
+	block_width
+	pad=$(lpad "$BW")
+	local lp=$(( (BW - W) / 2 ))
+	for i in "${!LOGO[@]}"; do
+		printf '%s%*s%s%s%s%s%s\n' "$pad" "$lp" '' "$C_ORANGE" "${LOGO[$i]:0:35}" "$C_WHITE" "${LOGO[$i]:35}" "$C_0"
+	done
+	printf '%s%*s%s%*s%s\n' "$pad" "$lp" '' "$C_WHITE" "$W" "$TAG1" "$C_0"
+	printf '%s%*s%s%*s%s\n' "$pad" "$lp" '' "$C_DIM" "$W" "$TAG2" "$C_0"
+	printf '%s%s%s%s\n' "$pad" "$C_RULE" "$(rule "$BW")" "$C_0"
+	a=$(info_line1); b=$(info_line2)
+	printf '%s%s\n' "$pad" "$(in_block "$(info_line1_c)" ${#a})"
+	printf '%s%s\n' "$pad" "$(in_block "$(info_line2_c)" ${#b})"
+	printf '%s%s%s%s\n' "$pad" "$C_RULE" "$(rule "$BW")" "$C_0"
+}
+
+# ---- splash animation --------------------------------------------------------------
+
+at() { printf '\e[%d;%dH' "$1" "$2"; }
+
+splash() {
+	exec </dev/null
+	export TERM=${TERM:-linux}
+	[ "$TERM" = dumb ] && TERM=linux
+	term_size
+	console_palette
+	set_colors "$(color_mode)"
+	collect
+	block_width
+	local top left lx i k n
+	top=$(( (ROWS - 12) / 2 )); [ $top -lt 1 ] && top=1
+	left=$(( (COLS - BW) / 2 + 1 )); [ $left -lt 1 ] && left=1
+	lx=$(( left + (BW - W) / 2 ))
+
+	printf '\e[?25l\e[2J\e[H'
+	trap 'printf "\e[0m\e[?25h"' EXIT
+
+	# 1. the logo wipes in from the left, a bright edge leading
+	for (( k = 0; k <= W + 3; k += 3 )); do
+		for i in "${!LOGO[@]}"; do
+			at $(( top + i )) "$lx"
+			n=$(( k > W ? W : k ))
+			local line=${LOGO[$i]}
+			local head=${line:0:n} edge=${line:n:3}
+			if [ $n -le 35 ]; then
+				printf '%s%s%s%s%s' "$C_ORANGE" "$head" "$C_HOT" "$edge" "$C_0"
+			else
+				printf '%s%s%s%s%s%s%s' "$C_ORANGE" "${line:0:35}" "$C_WHITE" "${head:35}" "$C_HOT" "$edge" "$C_0"
+			fi
+		done
+		sleep 0.012
+	done
+	for i in "${!LOGO[@]}"; do
+		at $(( top + i )) "$lx"
+		printf '%s%s%s%s%s' "$C_ORANGE" "${LOGO[$i]:0:35}" "$C_WHITE" "${LOGO[$i]:35}" "$C_0"
+	done
+
+	# 2. the tagline types itself out
+	for (( k = 1; k <= ${#TAG1}; k++ )); do
+		at $(( top + 4 )) $(( lx + W - ${#TAG1} ))
+		printf '%s%s%s' "$C_WHITE" "${TAG1:0:k}" "$C_0"
+		sleep 0.008
+	done
+	at $(( top + 5 )) $(( lx + W - ${#TAG2} )); printf '%s%s%s' "$C_DIM" "$TAG2" "$C_0"
+
+	# 3. the rules open from the middle
+	local mid=$(( left + BW / 2 ))
+	for (( k = 0; k <= BW / 2 + 1; k += 2 )); do
+		for i in 6 9; do
+			at $(( top + i )) $(( mid - k < left ? left : mid - k ))
+			printf '%s%s%s' "$C_RULE" "$(rule $(( 2 * k > BW ? BW : 2 * k )))" "$C_0"
+		done
+		sleep 0.006
+	done
+
+	# 4. the live lines; the network gets a few seconds to come up
+	local spin='|/-\' s=0 t a b
+	for (( t = 0; t < 40; t++ )); do
+		collect
+		[ -n "$IP4$IP6" ] && break
+		at $(( top + 8 )) "$left"; printf '\e[K'
+		at $(( top + 8 )) $(( left + BW / 2 - 12 ))
+		printf '%swaiting for the network %s%s' "$C_DIM" "${spin:s++%4:1}" "$C_0"
+		at $(( top + 7 )) "$left"; a=$(info_line1); printf '%s' "$(in_block "$(info_line1_c)" ${#a})"
+		sleep 0.2
+	done
+	at $(( top + 7 )) "$left"; printf '\e[K'; a=$(info_line1); printf '%s' "$(in_block "$(info_line1_c)" ${#a})"
+	at $(( top + 8 )) "$left"; printf '\e[K'; b=$(info_line2); printf '%s' "$(in_block "$(info_line2_c)" ${#b})"
+
+	# 5. and, quietly, what Rise would say if anyone could hear her
+	local wc=$(( left + (BW - ${#WHISPER}) / 2 ))
+	for (( k = 1; k <= ${#WHISPER}; k++ )); do
+		at $(( top + 11 )) "$wc"
+		printf '%s%s%s' "$C_RULE" "${WHISPER:0:k}" "$C_0"
+		sleep 0.03
+	done
+	sleep 1.2
+	at "$ROWS" 1
+}
+
+# ---- /etc/issue ----------------------------------------------------------------------
+
+issue() {
+	[ "${ISSUE_REFRESH:-10}" = 0 ] && [ -s /etc/issue ] && grep -q 'RISE' /etc/issue && return 0
+	export TERM=linux
+	local s
+	s=$(stty size < /dev/tty1 2>/dev/null) || s="48 128"
+	RISE_ROWS=${s% *}; RISE_COLS=${s#* }
+	term_size
+	set_colors 16
+	collect
+	local body top
+	body=$(render)
+	top=$(( (ROWS - 14) / 2 )); [ $top -lt 0 ] && top=0
+	{
+		printf '\e]P3E95420'
+		printf '%*s' "$top" '' | tr ' ' '\n'
+		# agetty reads backslash escapes in /etc/issue
+		printf '%s\n' "${body//\\/\\\\}"
+		local hint="Manage this server at https://${VPN_DOMAIN:-${IP4:-<address>}}:${WEBGUI_PORT:-18080}"
+		printf '\n%s%s%s\n\n' "$(lpad ${#hint})" "$C_DIM$hint" "$C_0"
+	} > /run/rise/issue.new
+	if ! cmp -s /run/rise/issue.new /etc/issue; then
+		cp /run/rise/issue.new /etc/issue
+		agetty --reload 2>/dev/null || true
+	fi
+	rm -f /run/rise/issue.new
+}
+
+# ---- login shells ----------------------------------------------------------------------
+
+login() {
+	[ -t 1 ] || return 0
+	term_size
+	set_colors "$(color_mode)"
+	collect
+	[ "$COLS" -ge "$W" ] || { printf '%s\n' "$TAG1" "$(info_line1)" "$(info_line2)"; return 0; }
+	local tty
+	tty=$(readlink /proc/$$/fd/1 2>/dev/null)
+	echo
+	case "$tty" in
+	/dev/pts/*)
+		# a quick wipe over ssh: the logo rows grow, then the rest at once
+		local pad k i
+		block_width; pad=$(lpad "$BW"); local lp=$(( (BW - W) / 2 ))
+		printf '\e[?25l'
+		for i in "${!LOGO[@]}"; do echo; done
+		for (( k = 0; k <= W; k += 6 )); do
+			printf '\e[%dA' "${#LOGO[@]}"
+			for i in "${!LOGO[@]}"; do
+				local line=${LOGO[$i]:0:k}
+				printf '\r%s%*s%s%s%s%s%s\n' "$pad" "$lp" '' "$C_ORANGE" "${line:0:35}" "$C_WHITE" "${line:35}" "$C_0"
+			done
+			sleep 0.01
+		done
+		printf '\e[%dA\e[?25h' "${#LOGO[@]}"
+		render
+		;;
+	*) render ;;
+	esac
+	echo
+}
+
+case "${1:-print}" in
+splash) splash ;;
+issue) issue ;;
+login) login ;;
+print) term_size; set_colors "$(color_mode)"; collect; render ;;
+*) echo "usage: $0 splash|issue|login|print" >&2; exit 2 ;;
+esac

@@ -1,0 +1,237 @@
+#!/bin/bash
+# firewall start|stop|show -- the whole RISE ruleset, IPv4 and IPv6, loaded
+# atomically with iptables-restore. Rules name interfaces, so they apply
+# before the VPN's TAP device exists.
+#
+# This server:  from the WAN side, SSH, the WebGUI, ACME (80) and SoftEther's
+#               ports only. From the VPN side, DHCP, DHCPv6, neighbour
+#               discovery and (optionally) a ping of the gateway; nothing else,
+#               on any of this server's addresses.
+# VPN clients:  routed to the internet with NAT (full cone when the module is
+#               there) and NAT66; isolated from each other (VPN_ISOLATION);
+#               optionally kept off private networks (VPN_BLOCK_LAN).
+# Port forwards: /etc/rise/portfwd.conf, "family proto port dest dport on note"
+. /usr/lib/rise/common.sh
+
+FIRSTBOOT=0
+[ -e "$RISE_STATE/firstboot-pending" ] && FIRSTBOOT=1
+
+csv() { echo "$*" | tr -s ' ' ','; }
+
+# local service ports a full cone mapping must never shadow
+local_tcp_ports() { echo "$SSH_PORT $WEBGUI_PORT 80 $SOFTETHER_TCP_PORTS"; }
+local_udp_ports() {
+	local p="$SOFTETHER_UDP_PORTS 67 68 546 547"
+	is_on "$SOFTETHER_VPN_OVER_DNS" && p="$p 53"
+	echo "$p"
+}
+
+# port forwards of one family: "proto|extport|dest|dport"
+portfwds() {
+	local fam=$1
+	[ -r "$RISE_PORTFWD" ] || return 0
+	awk -v fam="$fam" '
+		/^[[:space:]]*(#|$)/ { next }
+		$1 == fam && $6 == "1" {
+			n = split($2 == "both" ? "tcp udp" : $2, p, " ")
+			for (i = 1; i <= n; i++) print p[i] "|" $3 "|" $4 "|" $5
+		}' "$RISE_PORTFWD"
+}
+
+filter_rules() {
+	local fam=$1 net gw icmp
+	if [ "$fam" = 4 ]; then
+		net=$(ipq network "$VPN_IPV4"); gw=$(ipq addr "$VPN_IPV4"); icmp=icmp
+	else
+		net=$(ipq network "$VPN_IPV6"); gw=$(ipq addr "$VPN_IPV6"); icmp=ipv6-icmp
+	fi
+	cat <<-EOF
+	*filter
+	:INPUT DROP [0:0]
+	:FORWARD DROP [0:0]
+	:OUTPUT ACCEPT [0:0]
+	:RISE_IN_VPN - [0:0]
+	:RISE_IN_WAN - [0:0]
+	-A INPUT -i lo -j ACCEPT
+	-A INPUT -i $TAP_IF -j RISE_IN_VPN
+	-A INPUT -m conntrack --ctstate INVALID -j DROP
+	-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+	-A INPUT -j RISE_IN_WAN
+	EOF
+
+	# ---- from the VPN: only what a client needs to get on the network
+	echo "-A RISE_IN_VPN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+	if [ "$fam" = 4 ]; then
+		echo "-A RISE_IN_VPN -p udp --sport 68 --dport 67 -j ACCEPT"
+		is_on "$VPN_ALLOW_PING" && echo "-A RISE_IN_VPN -p icmp --icmp-type echo-request -d $gw -m limit --limit 20/s -j ACCEPT"
+	else
+		local t
+		# router solicitation, neighbour solicitation/advertisement
+		for t in 133 135 136; do
+			echo "-A RISE_IN_VPN -p ipv6-icmp --icmpv6-type $t -m hl --hl-eq 255 -j ACCEPT"
+		done
+		echo "-A RISE_IN_VPN -p udp --sport 546 --dport 547 -j ACCEPT"
+		is_on "$VPN_ALLOW_PING" && echo "-A RISE_IN_VPN -p ipv6-icmp --icmpv6-type echo-request -d $gw -m limit --limit 20/s -j ACCEPT"
+	fi
+	echo "-A RISE_IN_VPN -j DROP"
+
+	# ---- from the WAN (and any other interface)
+	if [ "$fam" = 4 ]; then
+		echo "-A RISE_IN_WAN -p icmp --icmp-type echo-request -m limit --limit 20/s -j ACCEPT"
+		echo "-A RISE_IN_WAN -p icmp -m conntrack --ctstate RELATED -j ACCEPT"
+		echo "-A RISE_IN_WAN -p udp --sport 67 --dport 68 -j ACCEPT"
+	else
+		echo "-A RISE_IN_WAN -p ipv6-icmp -j ACCEPT"
+		echo "-A RISE_IN_WAN -p udp -s fe80::/10 --sport 547 --dport 546 -j ACCEPT"
+	fi
+	echo "-A RISE_IN_WAN -p tcp -m multiport --dports $(csv "$SSH_PORT" "$WEBGUI_PORT" 80) -j ACCEPT"
+	if [ "$FIRSTBOOT" = 0 ]; then
+		echo "-A RISE_IN_WAN -p tcp -m multiport --dports $(csv "$SOFTETHER_TCP_PORTS") -j ACCEPT"
+		[ -n "$SOFTETHER_UDP_PORTS" ] && echo "-A RISE_IN_WAN -p udp -m multiport --dports $(csv "$SOFTETHER_UDP_PORTS") -j ACCEPT"
+		is_on "$SOFTETHER_VPN_OVER_DNS" && echo "-A RISE_IN_WAN -p udp --dport 53 -j ACCEPT"
+		is_on "$SOFTETHER_UDP_ACCEL" && echo "-A RISE_IN_WAN -p udp --dport 1024:65535 -j ACCEPT"
+		if is_on "$SOFTETHER_VPN_OVER_ICMP" && [ "$fam" = 4 ]; then
+			echo "-A RISE_IN_WAN -p icmp -j ACCEPT"
+		fi
+	fi
+
+	# ---- forwarding
+	cat <<-EOF
+	-A FORWARD -m conntrack --ctstate INVALID -j DROP
+	-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+	-A FORWARD -m conntrack --ctstate DNAT -j ACCEPT
+	EOF
+	[ "$fam" = 6 ] && echo "-A FORWARD -p ipv6-icmp -j ACCEPT"
+	if is_on "$VPN_ISOLATION"; then
+		echo "-A FORWARD -i $TAP_IF -o $TAP_IF -j DROP"
+	else
+		echo "-A FORWARD -i $TAP_IF -o $TAP_IF -s $net -d $net -j ACCEPT"
+	fi
+	if is_on "$VPN_BLOCK_LAN"; then
+		local p
+		if [ "$fam" = 4 ]; then
+			for p in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16; do
+				echo "-A FORWARD -i $TAP_IF -d $p -j DROP"
+			done
+		else
+			for p in fc00::/7 fe80::/10; do
+				echo "-A FORWARD -i $TAP_IF -d $p -j DROP"
+			done
+		fi
+	fi
+	echo "-A FORWARD -i $TAP_IF -s $net -j ACCEPT"
+	echo "COMMIT"
+}
+
+# nat: port forwards, then full cone or masquerade for the VPN prefix
+nat_rules() {
+	local fam=$1 fullcone=$2 net range
+	if [ "$fam" = 4 ]; then net=$(ipq network "$VPN_IPV4"); else net=$(ipq network "$VPN_IPV6"); fi
+	range=$NAT_PORT_RANGE
+	cat <<-EOF
+	*nat
+	:PREROUTING ACCEPT [0:0]
+	:INPUT ACCEPT [0:0]
+	:OUTPUT ACCEPT [0:0]
+	:POSTROUTING ACCEPT [0:0]
+	EOF
+	local line proto ext dst dport to
+	while IFS='|' read -r proto ext dst dport; do
+		[ -n "$proto" ] || continue
+		ext=${ext/-/:}
+		dport=${dport:-$ext}
+		[ "$dport" = "-" ] && dport=$ext
+		dport=${dport/:/-}
+		if [ "$fam" = 4 ]; then to="$dst:$dport"; else to="[$dst]:$dport"; fi
+		echo "-A PREROUTING -i $WAN_IF -p $proto --dport $ext -j DNAT --to-destination $to"
+	done < <(portfwds "$fam")
+	if [ "$fullcone" = 1 ]; then
+		# local services first: a client mapping must not take their ports
+		echo "-A PREROUTING -i $WAN_IF -p tcp -m multiport --dports $(csv "$(local_tcp_ports)") -j RETURN"
+		echo "-A PREROUTING -i $WAN_IF -p udp -m multiport --dports $(csv "$(local_udp_ports)") -j RETURN"
+		echo "-A PREROUTING -i $WAN_IF -j FULLCONENAT"
+		echo "-A POSTROUTING -s $net -o $WAN_IF -p tcp -j FULLCONENAT --to-ports $range"
+		echo "-A POSTROUTING -s $net -o $WAN_IF -p udp -j FULLCONENAT --to-ports $range"
+		echo "-A POSTROUTING -s $net -o $WAN_IF -j FULLCONENAT"
+	else
+		echo "-A POSTROUTING -s $net -o $WAN_IF -p tcp -j MASQUERADE --to-ports $range"
+		echo "-A POSTROUTING -s $net -o $WAN_IF -p udp -j MASQUERADE --to-ports $range"
+		echo "-A POSTROUTING -s $net -o $WAN_IF -j MASQUERADE"
+	fi
+	# other interfaces (a LAN beside the WAN): plain masquerade
+	echo "-A POSTROUTING -s $net ! -d $net ! -o $TAP_IF -j MASQUERADE"
+	echo "COMMIT"
+}
+
+mangle_rules() {
+	cat <<-EOF
+	*mangle
+	:PREROUTING ACCEPT [0:0]
+	:INPUT ACCEPT [0:0]
+	:FORWARD ACCEPT [0:0]
+	:OUTPUT ACCEPT [0:0]
+	:POSTROUTING ACCEPT [0:0]
+	-A FORWARD -o $TAP_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+	-A FORWARD -i $TAP_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+	COMMIT
+	EOF
+}
+
+fullcone_ok() {
+	is_on "$NAT_FULLCONE" || return 1
+	modprobe xt_FULLCONENAT 2>/dev/null || return 1
+}
+
+ruleset() {
+	local fam=$1 fc=$2
+	filter_rules "$fam"
+	if [ "$fam" = 4 ] || is_on "$NAT66"; then nat_rules "$fam" "$fc"; fi
+	mangle_rules
+}
+
+load() {
+	local fam=$1 restore fc=0
+	if [ "$fam" = 4 ]; then restore=iptables-restore; else restore=ip6tables-restore; fi
+	fullcone_ok && fc=1
+	if [ "$fam" = 6 ] && ! is_on "$VPN_IPV6_ENABLE"; then
+		VPN_IPV6=${VPN_IPV6:-fd00:255::1/64}
+	fi
+	if ruleset "$fam" "$fc" | $restore; then
+		echo "$fc" > "$RISE_RUN/fullcone$fam"
+		return 0
+	fi
+	if [ $fc = 1 ]; then
+		log "IPv$fam: FULLCONENAT rules failed, using MASQUERADE"
+		ruleset "$fam" 0 | $restore && { echo 0 > "$RISE_RUN/fullcone$fam"; return 0; }
+	fi
+	return 1
+}
+
+start() {
+	modprobe nf_conntrack 2>/dev/null || true
+	local rc=0
+	load 4 || { log "IPv4 ruleset failed"; rc=1; }
+	load 6 || { log "IPv6 ruleset failed"; rc=1; }
+	[ "$FIRSTBOOT" = 1 ] && log "first boot: SoftEther ports stay closed until it is configured"
+	return $rc
+}
+
+stop() {
+	local t c
+	for c in iptables ip6tables; do
+		for t in filter nat mangle; do
+			$c -t "$t" -F 2>/dev/null; $c -t "$t" -X 2>/dev/null
+		done
+		$c -P INPUT ACCEPT; $c -P FORWARD DROP; $c -P OUTPUT ACCEPT
+	done
+}
+
+case "${1:-start}" in
+start|reload|restart) start ;;
+stop) stop ;;
+show)
+	fc=0; fullcone_ok && fc=1
+	echo "# ---- IPv4"; ruleset 4 $fc
+	echo "# ---- IPv6"; ruleset 6 $fc ;;
+*) echo "usage: $0 start|stop|show" >&2; exit 2 ;;
+esac

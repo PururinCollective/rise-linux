@@ -1,0 +1,70 @@
+#!/bin/bash
+# console font|mode MODE -- the text console.
+#
+#   font        Unifont 8x16 (Uni2-Fixed16, the Ubuntu Server installer's font)
+#               on tty1-6; doubled to 16x32 when the framebuffer is wide
+#               (CONSOLE_FONT_SCALE=auto: 1920 pixels and up), so a hi-res
+#               monitor keeps a readable 120x33 or larger console
+#   mode MODE   the resolution: 1024x768 (the default), another WxH, or native.
+#               Writes GRUB_GFXMODE and video= into /etc/default/grub and runs
+#               update-grub; takes effect at the next boot
+. /usr/lib/rise/common.sh
+
+FONT=/usr/share/consolefonts/Uni2-Fixed16.psf.gz
+
+fb_width() {
+	local v
+	v=$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null) || v=
+	echo "${v%%,*}"
+}
+
+font() {
+	[ -r "$FONT" ] || FONT=$(ls /usr/share/consolefonts/Uni2-*16.psf.gz 2>/dev/null | head -n1)
+	[ -n "$FONT" ] || exit 0
+	local scale=${CONSOLE_FONT_SCALE:-auto} w
+	if [ "$scale" = auto ]; then
+		w=$(fb_width)
+		scale=1
+		[ -n "$w" ] && [ "$w" -ge 1920 ] && scale=2
+	fi
+	local args=()
+	[ "$scale" = 2 ] && args=(-d)
+	local t
+	for t in /dev/tty1 /dev/tty2 /dev/tty3 /dev/tty4 /dev/tty5 /dev/tty6; do
+		[ -e "$t" ] && setfont "${args[@]}" -C "$t" "$FONT" 2>/dev/null
+	done
+	# Ubuntu orange for colour 3, as in the installer
+	printf '\e]P3E95420' > /dev/tty1 2>/dev/null || true
+	return 0
+}
+
+mode() {
+	local m=${1:-$CONSOLE_MODE}
+	case "$m" in
+	native|auto) m=native ;;
+	[0-9]*x[0-9]*) ;;
+	*) die "mode: 1024x768, WxH or native" ;;
+	esac
+	local gfx video
+	if [ "$m" = native ]; then gfx=auto; video=; else gfx="$m,auto"; video=" video=$m"; fi
+	python3 -I - /etc/default/grub "$gfx" "$video" <<'PY'
+import re, sys
+p, gfx, video = sys.argv[1:]
+s = open(p).read()
+s = re.sub(r'^GRUB_GFXMODE=.*$', 'GRUB_GFXMODE=' + gfx, s, flags=re.M)
+def fix(m):
+    v = re.sub(r'\s*video=\S+', '', m.group(1)).strip()
+    return 'GRUB_CMDLINE_LINUX="%s"' % (v + video).strip()
+s = re.sub(r'^GRUB_CMDLINE_LINUX="(.*)"$', fix, s, flags=re.M)
+open(p, 'w').write(s)
+PY
+	conf_set CONSOLE_MODE "$m"
+	update-grub >/dev/null 2>&1 || die "update-grub failed"
+	log "console mode $m from the next boot"
+}
+
+case "${1:-font}" in
+font) font ;;
+mode) mode "${2:-}" ;;
+*) echo "usage: $0 font|mode MODE" >&2; exit 2 ;;
+esac

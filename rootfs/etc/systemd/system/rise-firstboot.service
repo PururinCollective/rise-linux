@@ -1,0 +1,16 @@
+[Unit]
+Description=RISE first boot: configure SoftEther VPN
+After=rise-vpnserver.service rise-firewall.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/rise/firstboot-pending
+ConditionKernelCommandLine=!boot=casper
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/rise/softether-setup firstboot
+ExecStartPost=-/usr/bin/systemctl start --no-block rise-cert.service
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,148 @@
+#!/usr/bin/python3 -I
+"""statsd -- RISE traffic statistics, sampled once a second.
+
+Writes, for the WebGUI and the console banner:
+  /run/rise/rates.json      current rates of every interface, the last 5 minutes
+                            of WAN and VPN rates (1 s), and the peaks
+  /run/rise/rates.sh        WAN_RX_BPS= WAN_TX_BPS= VPN_RX_BPS= VPN_TX_BPS=
+  /var/lib/rise/peaks.json  peak rates (all time and today), kept across reboots
+  /var/lib/rise/history.json the last 48 hours at 1-minute resolution
+"""
+import json
+import os
+import shlex
+import signal
+import time
+
+RUN = "/run/rise"
+STATE = "/var/lib/rise"
+
+
+def conf():
+    c = {"WAN_IF": "eth0", "VPN_TAP": "vpn"}
+    for path in ("/etc/rise/rise.conf.default", "/etc/rise/rise.conf"):
+        try:
+            for line in open(path):
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                parts = shlex.split(v, comments=True)
+                c[k.strip()] = parts[0] if parts else ""
+        except OSError:
+            pass
+    return c
+
+
+def counters():
+    out = {}
+    for ifn in os.listdir("/sys/class/net"):
+        try:
+            with open(f"/sys/class/net/{ifn}/statistics/rx_bytes") as f:
+                rx = int(f.read())
+            with open(f"/sys/class/net/{ifn}/statistics/tx_bytes") as f:
+                tx = int(f.read())
+            out[ifn] = (rx, tx)
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+def main():
+    os.makedirs(RUN, exist_ok=True)
+    os.makedirs(STATE, exist_ok=True)
+    peaks = load(f"{STATE}/peaks.json", {})
+    history = load(f"{STATE}/history.json", [])
+    recent = []
+    minute = {"t": 0, "wan_rx": 0, "wan_tx": 0, "vpn_rx": 0, "vpn_tx": 0, "n": 0}
+    prev, prev_t = counters(), time.monotonic()
+    c, c_t = conf(), time.time()
+    last_save = time.time()
+
+    def stop(*_):
+        save(f"{STATE}/peaks.json", peaks)
+        save(f"{STATE}/history.json", history)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while True:
+        time.sleep(1.0 - (time.time() % 1.0))
+        if time.time() - c_t > 30:
+            c, c_t = conf(), time.time()
+        wan, vpn = c.get("WAN_IF", "eth0"), "tap_" + c.get("VPN_TAP", "vpn")
+        now, now_t = counters(), time.monotonic()
+        dt = max(now_t - prev_t, 0.001)
+        rates = {}
+        for ifn, (rx, tx) in now.items():
+            if ifn in prev:
+                prx, ptx = prev[ifn]
+                # a counter that went back (interface re-created) restarts at 0
+                rates[ifn] = {
+                    "rx_bps": int(max(rx - prx, 0) * 8 / dt),
+                    "tx_bps": int(max(tx - ptx, 0) * 8 / dt),
+                    "rx_bytes": rx,
+                    "tx_bytes": tx,
+                }
+        prev, prev_t = now, now_t
+        w = rates.get(wan, {"rx_bps": 0, "tx_bps": 0})
+        v = rates.get(vpn, {"rx_bps": 0, "tx_bps": 0})
+        ts = int(time.time())
+        today = time.strftime("%Y-%m-%d")
+
+        for key, val in (("wan_rx", w["rx_bps"]), ("wan_tx", w["tx_bps"]),
+                         ("vpn_rx", v["rx_bps"]), ("vpn_tx", v["tx_bps"])):
+            p = peaks.setdefault(key, {"bps": 0, "at": 0, "day": today, "day_bps": 0, "day_at": 0})
+            if p.get("day") != today:
+                p.update(day=today, day_bps=0, day_at=0)
+            if val > p["bps"]:
+                p.update(bps=val, at=ts)
+            if val > p["day_bps"]:
+                p.update(day_bps=val, day_at=ts)
+
+        recent.append([ts, w["rx_bps"], w["tx_bps"], v["rx_bps"], v["tx_bps"]])
+        del recent[:-300]
+
+        m = ts // 60 * 60
+        if minute["t"] != m:
+            if minute["n"]:
+                n = minute["n"]
+                history.append([minute["t"], minute["wan_rx"] // n, minute["wan_tx"] // n,
+                                minute["vpn_rx"] // n, minute["vpn_tx"] // n])
+                del history[:-2880]
+            minute = {"t": m, "wan_rx": 0, "wan_tx": 0, "vpn_rx": 0, "vpn_tx": 0, "n": 0}
+        minute["wan_rx"] += w["rx_bps"]
+        minute["wan_tx"] += w["tx_bps"]
+        minute["vpn_rx"] += v["rx_bps"]
+        minute["vpn_tx"] += v["tx_bps"]
+        minute["n"] += 1
+
+        save(f"{RUN}/rates.json", {"t": ts, "wan": wan, "vpn": vpn, "rates": rates,
+                                   "recent": recent, "peaks": peaks})
+        with open(f"{RUN}/rates.sh.tmp", "w") as f:
+            f.write(f"WAN_RX_BPS={w['rx_bps']}\nWAN_TX_BPS={w['tx_bps']}\n"
+                    f"VPN_RX_BPS={v['rx_bps']}\nVPN_TX_BPS={v['tx_bps']}\n")
+        os.replace(f"{RUN}/rates.sh.tmp", f"{RUN}/rates.sh")
+        if time.time() - last_save > 60:
+            save(f"{STATE}/peaks.json", peaks)
+            save(f"{STATE}/history.json", history)
+            last_save = time.time()
+
+
+if __name__ == "__main__":
+    main()

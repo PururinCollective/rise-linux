@@ -1,0 +1,18 @@
+[Unit]
+Description=RISE DHCP, DHCPv6 and router advertisements for VPN clients
+After=rise-vpnserver.service network.target
+Wants=rise-vpnserver.service
+ConditionPathExists=/etc/rise/rise.conf
+ConditionKernelCommandLine=!boot=casper
+
+[Service]
+Type=simple
+ExecStartPre=/usr/lib/rise/dnsmasq-gen
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/rise/dnsmasq.conf
+ExecReload=/usr/lib/rise/dnsmasq-gen
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

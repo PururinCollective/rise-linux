@@ -1,0 +1,2 @@
+# SoftEther's TAP device: configure it whenever the VPN server creates it
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="tap_vpn", TAG+="systemd", ENV{SYSTEMD_WANTS}+="rise-vpn-net.service"

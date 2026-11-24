@@ -1,0 +1,53 @@
+#!/bin/bash
+# cert obtain|deploy|status -- the Let's Encrypt certificate of VPN_DOMAIN.
+#
+#   obtain   get the certificate if there is none yet (HTTP-01 on port 80, which
+#            must reach this server: forward it when behind NAT). rise-cert.timer
+#            runs this every 30 minutes until it succeeds, then it does nothing.
+#            Renewal is certbot's own timer; its deploy hook calls "deploy".
+#   deploy   load the certificate into SoftEther (live, no session drops) and
+#            restart the WebGUI so it serves the new one
+#   status   the certificate's names and expiry
+. /usr/lib/rise/common.sh
+
+live=/etc/letsencrypt/live/$VPN_DOMAIN
+
+obtain() {
+	[ -n "$VPN_DOMAIN" ] || { log "no VPN_DOMAIN set, no certificate"; return 0; }
+	if [ -r "$live/fullchain.pem" ]; then
+		return 0
+	fi
+	[ -e "$RISE_STATE/firstboot-pending" ] && { log "waiting for the first boot setup"; return 0; }
+	local mail=(--register-unsafely-without-email)
+	[ -n "$ACME_EMAIL" ] && mail=(--email "$ACME_EMAIL" --no-eff-email)
+	log "requesting a certificate for $VPN_DOMAIN"
+	certbot certonly --standalone --non-interactive --agree-tos "${mail[@]}" \
+		--preferred-challenges http --http-01-port 80 \
+		--cert-name "$VPN_DOMAIN" -d "$VPN_DOMAIN" --keep-until-expiring \
+		--deploy-hook /etc/letsencrypt/renewal-hooks/deploy/rise || {
+		log "certificate request failed: is $VPN_DOMAIN pointing here and tcp/80 forwarded? (retrying later)"
+		return 1
+	}
+	deploy
+}
+
+deploy() {
+	/usr/lib/rise/softether-setup cert || log "could not load the certificate into SoftEther"
+	systemctl try-restart rise-webgui.service || true
+}
+
+status() {
+	if [ -r "$live/cert.pem" ]; then
+		openssl x509 -in "$live/cert.pem" -noout -subject -issuer -enddate -ext subjectAltName 2>/dev/null
+	else
+		echo "no certificate for ${VPN_DOMAIN:-(no domain)}"
+	fi
+}
+
+case "${1:-obtain}" in
+obtain) obtain ;;
+deploy) deploy ;;
+status) status ;;
+renew) certbot renew --cert-name "$VPN_DOMAIN" --force-renewal --deploy-hook /etc/letsencrypt/renewal-hooks/deploy/rise ;;
+*) echo "usage: $0 obtain|deploy|renew|status" >&2; exit 2 ;;
+esac

@@ -1,0 +1,86 @@
+# Packages of the RISE Linux system (live ISO and installed system alike).
+# One per line; '#' starts a comment.
+
+# base
+systemd-sysv
+systemd-resolved
+systemd-timesyncd
+udev
+dbus
+sudo
+locales
+tzdata
+ca-certificates
+lsb-release
+apt-utils
+bash-completion
+less
+nano
+vim-tiny
+htop
+procps
+psmisc
+cron
+logrotate
+rsyslog
+kmod
+pciutils
+usbutils
+lshw
+file
+
+# kernel and boot
+initramfs-tools
+grub2-common
+grub-pc-bin
+grub-efi-amd64-bin
+efibootmgr
+os-prober-
+# the console: Unifont 8x16 (console-setup's Uni2-Fixed16), the font of the
+# Ubuntu Server installer; doubled on wide screens
+kbd
+console-setup
+
+# networking
+netplan.io
+iproute2
+iputils-ping
+iputils-tracepath
+traceroute
+iptables
+conntrack
+ethtool
+dnsmasq-base
+curl
+wget
+dnsutils
+tcpdump
+openssh-server
+ssh-import-id
+
+# VPN server runtime (SoftEther is built from source)
+libssl3t64
+libsodium23
+libreadline8t64
+zlib1g
+libncurses6
+certbot
+
+# full cone NAT kernel module, rebuilt on kernel updates
+dkms
+build-essential
+libxtables12
+
+# WebGUI
+python3
+python3-minimal
+
+# installer (live ISO); stays installed, it is small
+dialog
+parted
+gdisk
+dosfstools
+e2fsprogs
+squashfs-tools
+rsync
+casper

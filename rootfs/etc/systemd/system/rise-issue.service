@@ -1,0 +1,7 @@
+[Unit]
+Description=RISE login screen (tty1 banner with live addresses and speed)
+After=rise-splash.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/rise/banner issue

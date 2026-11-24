@@ -1,0 +1,141 @@
+#!/bin/bash
+# softether-setup -- configures SoftEther VPN Server through vpncmd.
+#
+#   firstboot   the first boot after the install: admin password, the hub, the
+#               TAP bridge, L2TP/IPsec, OpenVPN, SSTP, the first VPN user, client
+#               isolation, the certificate; then opens the VPN ports
+#   isolation   apply VPN_ISOLATION to the hub's access list
+#   cert        load the Let's Encrypt certificate (if there is one)
+#   psk NEW     set the IPsec pre-shared key
+#
+# The first boot keeps SoftEther's ports closed (rise-firewall reads
+# /var/lib/rise/firstboot-pending) while the server still has no password.
+. /usr/lib/rise/common.sh
+
+rand() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-24}"; }
+
+# lines of a CSV listing whose first field is $1
+csv_has() { awk -F, -v n="$1" '{gsub(/"/, "", $1)} $1 == n {f = 1} END {exit !f}'; }
+
+isolation() {
+	local mac i
+	for i in $(seq 1 30); do
+		[ -r "/sys/class/net/$TAP_IF/address" ] && break
+		sleep 1
+	done
+	mac=$(tr 'a-f:' 'A-F-' < "/sys/class/net/$TAP_IF/address" 2>/dev/null)
+	# remove what this script added before (memo starts with rise-iso)
+	local ids
+	ids=$(se @hub AccessList | awk -F, '/rise-iso/ {gsub(/"/, "", $1); print $1}')
+	for i in $ids; do se @hub AccessDelete "$i" >/dev/null; done
+	is_on "$VPN_ISOLATION" || { log "hub isolation off"; return 0; }
+	[ -n "$mac" ] || { log "no MAC address for $TAP_IF, hub isolation not applied"; return 1; }
+	local ff=FF-FF-FF-FF-FF-FF any="/SRCUSERNAME: /DESTUSERNAME: /SRCIP:0.0.0.0/0 /DESTIP:0.0.0.0/0 /PROTOCOL:0 /SRCPORT: /DESTPORT: /TCPSTATE:"
+	# unicast only to and from this server; broadcast and IPv6 multicast for
+	# ARP, DHCP and neighbour discovery; everything else (client to client) dropped
+	se @hub AccessAdd pass /MEMO:rise-iso-to-gw /PRIORITY:10 /SRCMAC: /DESTMAC:"$mac/$ff" $any >/dev/null
+	se @hub AccessAdd pass /MEMO:rise-iso-from-gw /PRIORITY:11 /SRCMAC:"$mac/$ff" /DESTMAC: $any >/dev/null
+	se @hub AccessAdd pass /MEMO:rise-iso-bcast /PRIORITY:12 /SRCMAC: /DESTMAC:"$ff/$ff" $any >/dev/null
+	se @hub AccessAdd pass /MEMO:rise-iso-mcast6 /PRIORITY:13 /SRCMAC: /DESTMAC:"33-33-00-00-00-00/FF-FF-00-00-00-00" $any >/dev/null
+	se @hub AccessAdd discard /MEMO:rise-iso-drop /PRIORITY:1000 /SRCMAC: /DESTMAC: $any >/dev/null
+	log "hub isolation on (gateway MAC $mac)"
+}
+
+cert() {
+	[ -n "$VPN_DOMAIN" ] || return 0
+	local live=/etc/letsencrypt/live/$VPN_DOMAIN
+	[ -r "$live/fullchain.pem" ] && [ -r "$live/privkey.pem" ] || return 0
+	se ServerCertSet /LOADCERT:"$live/fullchain.pem" /LOADKEY:"$live/privkey.pem" >/dev/null &&
+		log "SoftEther now uses the certificate of $VPN_DOMAIN"
+}
+
+# config-file-only settings: the server must be stopped
+patch_config() {
+	python3 -I - "$SE_CONFIG" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8-sig").read()
+def setkey(block_re, key, val):
+    global s
+    m = re.search(block_re, s, re.S)
+    if not m: return
+    body = re.sub(r"(\n\s*\w+ %s )\S+" % key, r"\g<1>%s" % val, m.group(0), count=1)
+    s = s[:m.start()] + body + s[m.end():]
+setkey(r"declare DDnsClient\s*\{.*?\}", "Disabled", "true")
+for k, v in (("DisableJsonRpcWebApi", "true"), ("UseWebUI", "false"), ("UseKeepConnect", "false"),
+             ("EnableVpnAzure", "false"), ("AcceptOnlyTls", "true")):
+    s = re.sub(r"(\n\t\tbool %s )\S+" % k, r"\g<1>%s" % v, s, count=1)
+open(p, "w", encoding="utf-8").write(s)
+PY
+}
+
+firstboot() {
+	local pw psk
+	pw=$(se_password)
+	[ -n "$pw" ] || die "no admin password in $RISE_SECRETS/softether-admin"
+	psk=$(cat "$RISE_SECRETS/ipsec-psk" 2>/dev/null)
+	[ -n "$psk" ] || { psk=$(rand 12); echo "$psk" > "$RISE_SECRETS/ipsec-psk"; chmod 600 "$RISE_SECRETS/ipsec-psk"; }
+
+	systemctl start rise-vpnserver.service
+	SE_PW='' se_wait 90 || se_wait 5 || die "SoftEther does not answer on localhost:$(se_admin_port)"
+	# a fresh server has no password; a second run already has it
+	SE_PW='' se ServerPasswordSet "$pw" >/dev/null 2>&1 || true
+	se About >/dev/null || die "cannot log in to SoftEther with the stored admin password"
+
+	local hubs
+	hubs=$(se HubList)
+	if [ "$VPN_HUB" != DEFAULT ] && printf '%s\n' "$hubs" | csv_has DEFAULT; then
+		se HubDelete DEFAULT >/dev/null
+	fi
+	printf '%s\n' "$hubs" | csv_has "$VPN_HUB" || se HubCreate "$VPN_HUB" /PASSWORD:"$(rand 32)" >/dev/null
+	se BridgeList | grep -q "\"$VPN_TAP\"\|,$VPN_TAP," || \
+		se BridgeCreate "$VPN_HUB" /DEVICE:"$VPN_TAP" /TAP:yes >/dev/null
+
+	se IPsecEnable /L2TP:yes /L2TPRAW:no /ETHERIP:no /PSK:"$psk" /DEFAULTHUB:"$VPN_HUB" >/dev/null
+	se ProtoOptionsSet OpenVPN /NAME:Enabled /VALUE:yes >/dev/null
+	se ProtoOptionsSet SSTP /NAME:Enabled /VALUE:yes >/dev/null
+	local icmp=no dns=no
+	is_on "$SOFTETHER_VPN_OVER_ICMP" && icmp=yes
+	is_on "$SOFTETHER_VPN_OVER_DNS" && dns=yes
+	se VpnOverIcmpDnsEnable /ICMP:$icmp /DNS:$dns >/dev/null
+	se KeepDisable >/dev/null
+	se VpnAzureSetEnable no >/dev/null 2>&1 || true
+
+	se @hub SecureNatDisable >/dev/null
+	se @hub LogDisable packet >/dev/null
+	se @hub SetMaxSession 0 >/dev/null 2>&1 || true
+
+	# the first VPN user, if the installer was given one
+	if [ -r "$RISE_SECRETS/vpn-first-user" ]; then
+		local u p
+		IFS=: read -r u p < "$RISE_SECRETS/vpn-first-user"
+		if [ -n "$u" ] && [ -n "$p" ]; then
+			se @hub UserCreate "$u" /GROUP:none /REALNAME:none /NOTE:"created by the installer" >/dev/null 2>&1 || true
+			se @hub UserPasswordSet "$u" /PASSWORD:"$p" >/dev/null && log "VPN user $u created"
+		fi
+		shred -u "$RISE_SECRETS/vpn-first-user" 2>/dev/null || rm -f "$RISE_SECRETS/vpn-first-user"
+	fi
+
+	isolation || true
+	cert || true
+
+	# settings vpncmd has no command for
+	se Flush >/dev/null 2>&1 || true
+	systemctl stop rise-vpnserver.service
+	patch_config
+	rm -f "$RISE_STATE/firstboot-pending"
+	systemctl start rise-vpnserver.service
+	/usr/lib/rise/firewall reload
+	log "SoftEther is configured; the VPN ports are open"
+}
+
+case "${1:-}" in
+firstboot) firstboot ;;
+isolation) se_wait 30 && isolation ;;
+cert) se_wait 30 && cert ;;
+psk)
+	[ -n "${2:-}" ] || die "usage: $0 psk NEW"
+	se IPsecEnable /L2TP:yes /L2TPRAW:no /ETHERIP:no /PSK:"$2" /DEFAULTHUB:"$VPN_HUB" >/dev/null &&
+		{ echo "$2" > "$RISE_SECRETS/ipsec-psk"; chmod 600 "$RISE_SECRETS/ipsec-psk"; } ;;
+*) echo "usage: $0 firstboot|isolation|cert|psk NEW" >&2; exit 2 ;;
+esac

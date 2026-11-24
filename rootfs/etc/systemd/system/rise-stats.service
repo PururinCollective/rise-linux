@@ -1,0 +1,13 @@
+[Unit]
+Description=RISE traffic statistics (rates, peaks, history)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/lib/rise/statsd
+Restart=always
+RestartSec=2
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

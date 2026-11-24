@@ -1,0 +1,18 @@
+[Unit]
+Description=RISE firewall (IPv4, IPv6, NAT, full cone NAT, NAT66)
+DefaultDependencies=no
+After=local-fs.target systemd-modules-load.service systemd-sysctl.service
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+ConditionPathExists=/etc/rise/rise.conf
+ConditionKernelCommandLine=!boot=casper
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/rise/firewall start
+ExecReload=/usr/lib/rise/firewall reload
+
+[Install]
+WantedBy=multi-user.target

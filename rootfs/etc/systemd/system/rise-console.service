@@ -1,0 +1,14 @@
+[Unit]
+Description=RISE console font (Unifont, doubled on wide screens)
+DefaultDependencies=no
+After=systemd-vconsole-setup.service console-setup.service systemd-udev-settle.service
+Before=rise-splash.service getty@tty1.service rise-installer.service sysinit.target
+ConditionPathExists=/dev/tty1
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/rise/console font
+
+[Install]
+WantedBy=sysinit.target
