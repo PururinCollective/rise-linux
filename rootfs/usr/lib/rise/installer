@@ -497,8 +497,7 @@ write_secrets() {
 }
 
 do_install() {
-	local sq
-	echo "==== install attempt $(date -u +%T) on $DISK" >&2=$1 esp root
+	local sq=$1 esp root
 	progress 2 "Partitioning $DISK"
 	swapoff -a 2>/dev/null
 	umount -R "$TARGET" 2>/dev/null

@@ -55,7 +55,11 @@ set_colors() {
 
 # Ubuntu-orange palette on a Linux console (the installer's look)
 console_palette() {
-	[ "${TERM:-}" = linux ] || return 0
+	# a virtual console, whatever TERM says (systemd may start the splash with vt220)
+	case "$TERM:$(readlink /proc/$$/fd/1 2>/dev/null)" in
+	linux:*|*:/dev/tty[0-9]*) ;;
+	*) return 0 ;;
+	esac
 	printf '\e]P0111111\e]P3E95420\e]P7CCCCCC\e]P8555555\e]PBF0A050'
 }
 
@@ -274,6 +278,8 @@ login() {
 	[ "$COLS" -ge "$W" ] || { printf '%s\n' "$TAG1" "$(info_line1)" "$(info_line2)"; return 0; }
 	local tty
 	tty=$(readlink /proc/$$/fd/1 2>/dev/null)
+	# a local console already showed the banner above the login prompt (/etc/issue)
+	case "$tty" in /dev/tty[0-9]*) return 0 ;; esac
 	echo
 	case "$tty" in
 	/dev/pts/*)

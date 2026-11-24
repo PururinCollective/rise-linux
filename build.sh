@@ -369,8 +369,9 @@ stage_overlay() {
 
 	# root never logs in: the installer creates the sudo user
 	usermod -p '!' root
-	# predictable /etc/rise
+	# predictable /etc/rise; /var/crash because casper touches it at boot
 	install -d -m 0755 /etc/rise /var/lib/rise
+	install -d -m 1777 /var/crash
 	install -d -m 0700 /etc/rise/secrets
 
 	# console: Unifont 8x16, the font of the Ubuntu Server installer
