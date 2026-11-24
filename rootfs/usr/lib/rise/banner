@@ -20,7 +20,7 @@ TAG2="by Pururin Collective"
 WHISPER="Silent by design. Secure by nature."
 W=67
 
-mapfile -t LOGO < "$LOGO_FILE" 2>/dev/null || LOGO=("RISE Linux")
+mapfile -t RLOGO < "$LOGO_FILE" 2>/dev/null || RLOGO=("RISE Linux")
 
 # ---- colours ---------------------------------------------------------------------
 
@@ -71,9 +71,9 @@ human_rate() {
 }
 
 collect() {
-	. /etc/os-release 2>/dev/null
+	# in a subshell: os-release sets names of its own (LOGO, NAME, VERSION)
+	OSVER=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Ubuntu}")
 	HOST=$(hostname 2>/dev/null || cat /etc/hostname)
-	OSVER=${PRETTY_NAME:-Ubuntu}
 	KVER=$(uname -r)
 	IP4=$(wan_addr 4 2>/dev/null); IP4=${IP4%/*}
 	IP6=$(wan_addr 6 2>/dev/null); IP6=${IP6%/*}
@@ -139,8 +139,8 @@ render() {
 	block_width
 	pad=$(lpad "$BW")
 	local lp=$(( (BW - W) / 2 ))
-	for i in "${!LOGO[@]}"; do
-		printf '%s%*s%s%s%s%s%s\n' "$pad" "$lp" '' "$C_ORANGE" "${LOGO[$i]:0:35}" "$C_WHITE" "${LOGO[$i]:35}" "$C_0"
+	for i in "${!RLOGO[@]}"; do
+		printf '%s%*s%s%s%s%s%s\n' "$pad" "$lp" '' "$C_ORANGE" "${RLOGO[$i]:0:35}" "$C_WHITE" "${RLOGO[$i]:35}" "$C_0"
 	done
 	printf '%s%*s%s%*s%s\n' "$pad" "$lp" '' "$C_WHITE" "$W" "$TAG1" "$C_0"
 	printf '%s%*s%s%*s%s\n' "$pad" "$lp" '' "$C_DIM" "$W" "$TAG2" "$C_0"
@@ -174,10 +174,10 @@ splash() {
 
 	# 1. the logo wipes in from the left, a bright edge leading
 	for (( k = 0; k <= W + 3; k += 3 )); do
-		for i in "${!LOGO[@]}"; do
+		for i in "${!RLOGO[@]}"; do
 			at $(( top + i )) "$lx"
 			n=$(( k > W ? W : k ))
-			local line=${LOGO[$i]}
+			local line=${RLOGO[$i]}
 			local head=${line:0:n} edge=${line:n:3}
 			if [ $n -le 35 ]; then
 				printf '%s%s%s%s%s' "$C_ORANGE" "$head" "$C_HOT" "$edge" "$C_0"
@@ -187,9 +187,9 @@ splash() {
 		done
 		sleep 0.012
 	done
-	for i in "${!LOGO[@]}"; do
+	for i in "${!RLOGO[@]}"; do
 		at $(( top + i )) "$lx"
-		printf '%s%s%s%s%s' "$C_ORANGE" "${LOGO[$i]:0:35}" "$C_WHITE" "${LOGO[$i]:35}" "$C_0"
+		printf '%s%s%s%s%s' "$C_ORANGE" "${RLOGO[$i]:0:35}" "$C_WHITE" "${RLOGO[$i]:35}" "$C_0"
 	done
 
 	# 2. the tagline types itself out
@@ -281,16 +281,16 @@ login() {
 		local pad k i
 		block_width; pad=$(lpad "$BW"); local lp=$(( (BW - W) / 2 ))
 		printf '\e[?25l'
-		for i in "${!LOGO[@]}"; do echo; done
+		for i in "${!RLOGO[@]}"; do echo; done
 		for (( k = 0; k <= W; k += 6 )); do
-			printf '\e[%dA' "${#LOGO[@]}"
-			for i in "${!LOGO[@]}"; do
-				local line=${LOGO[$i]:0:k}
+			printf '\e[%dA' "${#RLOGO[@]}"
+			for i in "${!RLOGO[@]}"; do
+				local line=${RLOGO[$i]:0:k}
 				printf '\r%s%*s%s%s%s%s%s\n' "$pad" "$lp" '' "$C_ORANGE" "${line:0:35}" "$C_WHITE" "${line:35}" "$C_0"
 			done
 			sleep 0.01
 		done
-		printf '\e[%dA\e[?25h' "${#LOGO[@]}"
+		printf '\e[%dA\e[?25h' "${#RLOGO[@]}"
 		render
 		;;
 	*) render ;;

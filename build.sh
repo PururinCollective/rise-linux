@@ -267,8 +267,8 @@ stage_softether() {
 	# the upstream unit is replaced by rise-vpnserver.service
 	rm -f "$ROOT"/{lib,usr/lib}/systemd/system/softether-*.service
 	local ver build
-	ver=$(sed -n 's/^ *VERSION "\([0-9.]*\)\${BUILD_NUMBER}".*/\1/p' "$SRC/softether/CMakeLists.txt" | head -n1)
-	build=${SOFTETHER_BUILD_NUMBER:-$(sed -n 's/^ *set(BUILD_NUMBER "\([0-9]*\)").*/\1/p' "$SRC/softether/CMakeLists.txt" | head -n1)}
+	ver=$(sed -n 's/^[[:space:]]*VERSION "\([0-9.]*\)\${BUILD_NUMBER}".*/\1/p' "$SRC/softether/CMakeLists.txt" | head -n1)
+	build=${SOFTETHER_BUILD_NUMBER:-$(sed -n 's/^[[:space:]]*set(BUILD_NUMBER "\([0-9]*\)").*/\1/p' "$SRC/softether/CMakeLists.txt" | head -n1)}
 	ver="${ver}${build}"
 	[ -n "$build" ] || ver=
 	echo "${ver:-unknown}" > "$ROOT/opt/softether/VERSION"
@@ -396,7 +396,7 @@ GRUB_DEFAULT=0
 GRUB_TIMEOUT_STYLE=menu
 GRUB_TIMEOUT=3
 GRUB_DISTRIBUTOR="RISE Linux"
-GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3 systemd.show_status=auto"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3 systemd.show_status=false rd.systemd.show_status=false rd.udev.log_level=3"
 GRUB_CMDLINE_LINUX="net.ifnames=0 biosdevname=0 video=1024x768"
 GRUB_TERMINAL_OUTPUT=gfxterm
 GRUB_GFXMODE=1024x768,auto
@@ -432,6 +432,12 @@ GR
 		mv /etc/rise-fullcone-built /usr/share/rise/fullcone-built
 	fi
 
+	# casper's desktop helpers have nothing to do here and print errors at boot
+	for s in 30accessibility 31disable_update_notifier 33enable_apport_crashes 41apt_cdrom \
+		20xconfig 22desktop_settings 34disable_kde_services 37disable_screensaver_lubuntu \
+		45jackd2 52gnome_initial_setup 59disable_mozc_autosetup 61desktop_canary_tweaks; do
+		rm -f /usr/share/initramfs-tools/scripts/casper-bottom/$s
+	done
 	update-initramfs -u -k all
 	EOF
 	mark_stage overlay

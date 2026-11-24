@@ -90,6 +90,17 @@ find_squashfs() {
 	return 1
 }
 
+live_consoles() {
+	mkdir -p /run/systemd/system/getty@.service.d
+	cat > /run/systemd/system/getty@.service.d/rise-live.conf <<-'EOF'
+	[Service]
+	ExecStart=
+	ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
+	EOF
+	systemctl daemon-reload
+	systemctl try-restart 'getty@tty2.service' 'getty@tty3.service' 2>/dev/null || true
+}
+
 live_network() {
 	# DHCP on every wired interface of the live system, for ssh-import-id and
 	# to see whether the address is private
@@ -367,7 +378,8 @@ Whoever learns one then has both. Use it anyway?" 11 74 || continue
 }
 
 port_note() {
-	local a=${IP4%/*}
+	local a=${IP4:-}
+	a=${a%/*}
 	[ "$NET4" = dhcp ] && a=$(ip -4 -o addr show dev "$WAN_IF" 2>/dev/null | awk '{print $4}' | head -n1) && a=${a%/*}
 	[ -n "$a" ] && is_private4 "$a" || return 0
 	echo "\n\Z3Note:\Zn $a is a private address: this server is behind NAT. Forward these\n\
@@ -380,6 +392,7 @@ ports from the router to it:\n\
 
 summary() {
 	STEP=8
+	local rc
 	local n4 n6
 	if [ "$NET4" = dhcp ]; then n4="DHCP"; else n4="$IP4 via $GW4, DNS $DNS4"; fi
 	case "$NET6" in auto) n6="automatic" ;; off) n6="disabled" ;; *) n6="$IP6 via $GW6" ;; esac
@@ -398,6 +411,9 @@ summary() {
   WebGUI          https://$VPN_DOMAIN:18080  ($WEB_USER)\n\
   SSH             port 9122, no root login\n\
 $(port_note)" 30 82 >/dev/null
+	rc=$?
+	[ $rc -le 1 ] || { echo "summary: dialog returned $rc" >&2; sleep 5; }
+	return $rc
 }
 
 # ---- the install ---------------------------------------------------------------------------
@@ -405,7 +421,7 @@ $(port_note)" 30 82 >/dev/null
 part() { case "$1" in *[0-9]) echo "${1}p$2" ;; *) echo "$1$2" ;; esac; }
 run() { echo "+ $*" >&2; "$@" >&2; }
 in_target() { chroot "$TARGET" /usr/bin/env -i HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive "$@"; }
-progress() { printf 'XXX\n%d\n%s\nXXX\n' "$1" "$2"; }
+progress() { printf 'XXX\n%d\n%s\nXXX\n' "$1" "$2"; echo "== $1% $2" >&2; }
 
 FAILED=
 fail() { FAILED=$1; echo "!! $1" >&2; }
@@ -505,8 +521,12 @@ do_install() {
 	[ -x "$TARGET/usr/lib/rise/banner" ] || { fail "copying the system from $sq"; return; }
 
 	progress 72 "Configuring"
-	for m in dev dev/pts proc sys run; do mount --bind "/$m" "$TARGET/$m"; done
-	[ -d /sys/firmware/efi/efivars ] && mount --bind /sys/firmware/efi/efivars "$TARGET/sys/firmware/efi/efivars" 2>/dev/null
+	# slave mounts: unmounting them later never reaches the live system's own
+	mount --make-rprivate "$TARGET"
+	run mount -t proc proc "$TARGET/proc"
+	run mount --rbind /sys "$TARGET/sys" && mount --make-rslave "$TARGET/sys"
+	run mount --rbind /dev "$TARGET/dev" && mount --make-rslave "$TARGET/dev"
+	run mount -t tmpfs tmpfs "$TARGET/run"
 	cat > "$TARGET/etc/fstab" <<-EOF
 	# <file system>                           <mount point> <type> <options>          <dump> <pass>
 	UUID=$(blkid -s UUID -o value "$root")  /          ext4   errors=remount-ro  0 1
@@ -607,6 +627,7 @@ $VPN_DOMAIN is requested (port 80 must reach this server).\n\n\
 
 main() {
 	palette
+	live_consoles
 	live_network
 	ask_welcome || return
 	local s=disk
@@ -621,7 +642,16 @@ main() {
 		softether) ask_softether && s=webgui || s=vpnnet ;;
 		webgui) ask_webgui && s=summary || s=softether ;;
 		summary) summary && s=install || s=webgui ;;
-		install) if install; then finish; return; else s=summary; fi ;;
+		install) if install; then finish; return; else s=failed; fi ;;
+		failed)
+			D "Install failed" --yes-label "Back" --no-label "Shell" --yesno \
+"\nThe install did not finish. Its log is $LOG (tty2 has a root shell).\n\n\
+Back returns to the summary; nothing is retried until you confirm it again." 11 74 >/dev/null
+			case $? in
+			0) s=summary ;;
+			1) clear; bash -l </dev/tty >/dev/tty 2>&1; s=summary ;;
+			*) echo "dialog gave no answer; waiting" >&2; sleep 30 ;;
+			esac ;;
 		esac
 	done
 }
