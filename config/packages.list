@@ -18,6 +18,7 @@ less
 nano
 vim-tiny
 htop
+btop
 procps
 psmisc
 cron
@@ -48,6 +49,8 @@ iputils-ping
 iputils-tracepath
 traceroute
 iptables
+net-tools
+iptraf-ng
 conntrack
 ethtool
 dnsmasq-base

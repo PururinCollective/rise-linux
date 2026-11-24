@@ -26,6 +26,13 @@ up() {
 	sysctl -qw "$c.proxy_arp=$parp" "$c.proxy_arp_pvlan=$parp" \
 		"$c.send_redirects=0" "$c.accept_redirects=0" "$c.rp_filter=1"
 
+	# the fixed MAC (rise.conf VPN_TAP_MAC); SoftEther's configuration has it
+	# too, this only covers a configuration edited by hand
+	if [ -n "${VPN_TAP_MAC:-}" ] &&
+	   [ "$(tr A-F a-f < "/sys/class/net/$TAP_IF/address")" != "$(echo "$VPN_TAP_MAC" | tr A-F a-f)" ]; then
+		ip link set dev "$TAP_IF" down
+		ip link set dev "$TAP_IF" address "$VPN_TAP_MAC" && log "$TAP_IF MAC set to $VPN_TAP_MAC"
+	fi
 	ip link set dev "$TAP_IF" mtu "$VPN_MTU" up
 	ip -4 addr flush dev "$TAP_IF" scope global
 	ip -4 addr add "$VPN_IPV4" dev "$TAP_IF"

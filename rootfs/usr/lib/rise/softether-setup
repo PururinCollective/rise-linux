@@ -23,7 +23,13 @@ isolation() {
 		[ -r "/sys/class/net/$TAP_IF/address" ] && break
 		sleep 1
 	done
-	mac=$(tr 'a-f:' 'A-F-' < "/sys/class/net/$TAP_IF/address" 2>/dev/null)
+	# the MAC rise.conf fixes (it becomes the TAP's at the next server start),
+	# or the one the TAP has now
+	if [ -n "${VPN_TAP_MAC:-}" ]; then
+		mac=$(echo "$VPN_TAP_MAC" | tr 'a-f:' 'A-F-')
+	else
+		mac=$(tr 'a-f:' 'A-F-' < "/sys/class/net/$TAP_IF/address" 2>/dev/null)
+	fi
 	# what this script added before (memo starts with rise-iso)
 	local ids
 	ids=$(se @hub AccessList | awk -F, '/rise-iso/ {gsub(/"/, "", $1); print $1}')
@@ -58,9 +64,9 @@ cert() {
 
 # config-file-only settings: the server must be stopped
 patch_config() {
-	python3 -I - "$SE_CONFIG" <<'PY'
+	python3 -I - "$SE_CONFIG" "${VPN_TAP_MAC:-}" <<'PY'
 import re, sys
-p = sys.argv[1]
+p, mac = sys.argv[1], sys.argv[2]
 s = open(p, encoding="utf-8-sig").read()
 def setkey(block_re, key, val):
     global s
@@ -69,6 +75,10 @@ def setkey(block_re, key, val):
     body = re.sub(r"(\n\s*\w+ %s )\S+" % key, r"\g<1>%s" % val, m.group(0), count=1)
     s = s[:m.start()] + body + s[m.end():]
 setkey(r"declare DDnsClient\s*\{.*?\}", "Disabled", "true")
+# the TAP's MAC address, fixed (rise.conf VPN_TAP_MAC); SoftEther writes it
+# with dashes
+if re.fullmatch(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", mac):
+    s = re.sub(r"(\n\s*string TapMacAddress )\S+", r"\g<1>" + mac.upper().replace(":", "-"), s)
 for k, v in (("DisableJsonRpcWebApi", "true"), ("UseWebUI", "false"), ("UseKeepConnect", "false"),
              ("EnableVpnAzure", "false"), ("AcceptOnlyTls", "true")):
     s = re.sub(r"(\n\t\tbool %s )\S+" % k, r"\g<1>%s" % v, s, count=1)

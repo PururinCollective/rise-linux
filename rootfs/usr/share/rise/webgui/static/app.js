@@ -324,7 +324,7 @@ async function viewStatus(main) {
 			["Load average", ov.load.map(x => x.toFixed(2)).join(", ")],
 			["Local time", ov.time], ["Uptime", duration(ov.uptime)],
 			["NAT", `IPv4 ${ov.fullcone.v4 ? "full cone" : "masquerade"} · IPv6 ${ov.conf.NAT66 === "1" ? (ov.fullcone.v6 ? "full cone NAT66" : "NAT66") : "off"}`],
-			["Certificate", ov.cert.present ? `${ov.domain}: ${ov.cert.days} days left` : (ov.domain ? `${ov.domain}: not issued yet` : "no domain")],
+			["Certificate", ov.cert.present ? `${ov.domain}: ${ov.cert.days} days left` : (ov.domain ? `${ov.domain}: not issued yet` : "self-signed (no domain, VPN by IP address)")],
 		]));
 		const m = ov.memory;
 		memBody.replaceChildren(
@@ -421,10 +421,14 @@ async function viewVpn(main) {
 			card("VPN network", [net, h("div", { class: "actions" }, act("Save & Apply", "settings", () => formData(net), { cls: "primary" }))]),
 			h("div", {},
 				card("Connect", kv([
-					["Server", conf.VPN_DOMAIN || "-"], ["SoftEther / SSTP", "TCP " + (conf.SOFTETHER_TCP_PORTS || "").split(" ").join(", ")],
+					["Server", conf.VPN_DOMAIN || ((S.ov && S.ov.wan.v4[0]) || "").split("/")[0] || "-"],
+					["Certificate", conf.VPN_DOMAIN ? "Let's Encrypt" : "self-signed"],
+					["TAP MAC", conf.VPN_TAP_MAC || "chosen by SoftEther"], ["SoftEther / SSTP", "TCP " + (conf.SOFTETHER_TCP_PORTS || "").split(" ").join(", ")],
 					["OpenVPN", "UDP 1194, TCP 443/1194"], ["L2TP/IPsec", "UDP 500, 4500"], ["Hub", conf.VPN_HUB]])),
 				card("IPsec pre-shared key", [h("div", { class: "inline" }, pskIn,
-					act("Set", "vpn", () => ({ action: "psk", psk: pskIn.value.trim() }), { cls: "primary" }))]),
+					act("Set", "vpn", () => ({ action: "psk", psk: pskIn.value.trim() }), { cls: "primary" })),
+					psk.weak ? h("p", { class: "hint" }, h("span", { class: "chip warn" }, "weak"),
+						" Easy to guess: whoever knows it can pose as this server to L2TP/IPsec clients.") : null]),
 				card("SoftEther", h("div", { class: "actions" },
 					act("Restart SoftEther", "service", { name: "vpnserver", action: "restart" }, { cls: "danger", confirm: "Every VPN session drops. Restart?" }))))));
 	S.timer = setInterval(async () => { if (live()) { try { fillSessions(await api("sessions")); } catch (e) { /* later */ } } }, 10000);

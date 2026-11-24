@@ -32,7 +32,9 @@ needs.
 | NAT | Full cone NAT (`xt_FULLCONENAT`, IPv4 and IPv6, built with DKMS), or masquerade if the module is missing |
 | Isolation | Clients cannot reach each other: blocked in the firewall and in the hub's access list |
 | Lockdown | VPN clients reach DHCP, DHCPv6, neighbour discovery and a ping of the gateway, and nothing else on the server |
-| TLS | Let's Encrypt for the VPN domain, renewed automatically and loaded into SoftEther without restarting it |
+| TLS | Let's Encrypt for the VPN domain, renewed automatically and loaded into SoftEther without restarting it. Without a domain, the VPN works by IP address with self-signed certificates |
+| TAP MAC | Fixed at install in the VRRP style: IANA's `00:00:5E` OUI, `00:00:5E:00:01:<VRID>` (for example `00:00:5E:00:01:D4`) |
+| Tools | `ifconfig` (net-tools), `btop`, `htop`, `iptraf-ng`, `tcpdump`, `conntrack` |
 | SSH | Port `9122`. root cannot log in; the installer creates a sudo user |
 | WebGUI | `https://<domain>:18080`: status, live traffic and peak speeds, sessions, port forwarding (IPv4/IPv6), DHCP static leases, WAN settings, certificate, services, logs, reboot |
 | Console | Unifont 8×16 (the Ubuntu Server installer's font) at 1024×768, doubled to 16×32 on screens 1920 pixels wide or more |
@@ -107,11 +109,16 @@ for:
    password, and optionally an SSH identity to import (`gh:user` or `lp:user`).
 4. **VPN domain**: the name for Let's Encrypt and the WebGUI (different from the
    hostname), an optional e-mail address, and agreement to the Let's Encrypt
-   Subscriber Agreement.
+   Subscriber Agreement. Leave it empty for a VPN by IP address: SoftEther and
+   the WebGUI then use self-signed certificates, port 80 stays closed, and a
+   domain can be added later in the WebGUI (System, Certificate).
 5. **VPN network**: the defaults or your own addresses; proxy-ARP `/32`
    (recommended) and client isolation.
 6. **SoftEther**: the server administrator password (for Server Manager), the IPsec
-   pre-shared key, and an optional first VPN user.
+   pre-shared key, and an optional first VPN user. A simple key such as `vpn`
+   is allowed, with a warning: every L2TP/IPsec client shares the key, and
+   whoever knows it can pose as the server to those clients. The installer also
+   picks the TAP interface's fixed MAC address here.
 7. **WebGUI**: its own user and password. It warns you if they match the sudo
    user's or SoftEther's, but lets you keep them.
 8. **Summary**: if the WAN address is private, it lists the ports to forward.
@@ -131,7 +138,7 @@ If the server is behind NAT, forward these ports to it:
 
 | Port | For |
 |---|---|
-| TCP 80 | Let's Encrypt (HTTP-01) |
+| TCP 80 | Let's Encrypt (HTTP-01), only with a domain |
 | TCP 443, 992, 1194, 5555 | SoftEther, SSTP, OpenVPN over TCP |
 | UDP 500, 4500 | L2TP/IPsec |
 | UDP 1194 | OpenVPN |
@@ -247,6 +254,11 @@ iso/grub.cfg             the ISO's boot menu
 rootfs/                  copied over the system: RISE scripts, systemd units, WebGUI
 example/*.sample         the SoftEther setup RISE started from (sanitized)
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE). SoftEther VPN and the other components keep
+their own licenses (below).
 
 ## Credits
 

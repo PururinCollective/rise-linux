@@ -13,7 +13,8 @@
 live=/etc/letsencrypt/live/$VPN_DOMAIN
 
 obtain() {
-	[ -n "$VPN_DOMAIN" ] || { log "no VPN_DOMAIN set, no certificate"; return 0; }
+	# no domain: an IP-based VPN with self-signed certificates, nothing to do
+	[ -n "$VPN_DOMAIN" ] || return 0
 	if [ -r "$live/fullchain.pem" ]; then
 		return 0
 	fi

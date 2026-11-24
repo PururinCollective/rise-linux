@@ -15,12 +15,17 @@ ISSUE_REFRESH="10"
 
 # ---- VPN ------------------------------------------------------------------------
 # the public name of the VPN, also the Let's Encrypt certificate and the
-# WebGUI address (https://VPN_DOMAIN:WEBGUI_PORT)
+# WebGUI address (https://VPN_DOMAIN:WEBGUI_PORT). Empty: an IP-based VPN, and
+# SoftEther and the WebGUI use self-signed certificates.
 VPN_DOMAIN=""
 ACME_EMAIL=""
 VPN_HUB="VPN"
 # SoftEther local bridge device: the interface is tap_<VPN_TAP>
 VPN_TAP="vpn"   # fixed: the udev rule and rise-vpn-net.service name tap_vpn
+# the TAP interface's MAC address, kept for good: IANA's 00:00:5E OUI in the
+# VRRP form 00:00:5E:00:01:<VRID>, the VRID picked at install. Empty keeps the
+# address SoftEther chose.
+VPN_TAP_MAC=""
 
 VPN_IPV4="10.255.255.1/24"
 VPN_DHCP_START="10.255.255.2"

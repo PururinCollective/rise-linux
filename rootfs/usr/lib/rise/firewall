@@ -84,7 +84,8 @@ filter_rules() {
 		echo "-A RISE_IN_WAN -p ipv6-icmp -j ACCEPT"
 		echo "-A RISE_IN_WAN -p udp -s fe80::/10 --sport 547 --dport 546 -j ACCEPT"
 	fi
-	echo "-A RISE_IN_WAN -p tcp -m multiport --dports $(csv "$SSH_PORT" "$WEBGUI_PORT" 80) -j ACCEPT"
+	# 80 only for Let's Encrypt, so only with a domain
+	echo "-A RISE_IN_WAN -p tcp -m multiport --dports $(csv "$SSH_PORT" "$WEBGUI_PORT" ${VPN_DOMAIN:+80}) -j ACCEPT"
 	if [ "$FIRSTBOOT" = 0 ]; then
 		echo "-A RISE_IN_WAN -p tcp -m multiport --dports $(csv "$SOFTETHER_TCP_PORTS") -j ACCEPT"
 		[ -n "$SOFTETHER_UDP_PORTS" ] && echo "-A RISE_IN_WAN -p udp -m multiport --dports $(csv "$SOFTETHER_UDP_PORTS") -j ACCEPT"

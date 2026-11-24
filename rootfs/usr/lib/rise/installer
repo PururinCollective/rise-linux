@@ -68,6 +68,21 @@ is_private4() { py 'a=ipaddress.ip_address(sys.argv[1]); assert a.is_private or 
 dns_list_ok() { local a; for a in $1; do v4_addr "$a" || v6_addr "$a" || return 1; done; }
 rand() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-12}"; }
 
+# the address clients and the browser use: the domain, or the WAN's IPv4
+server_addr() {
+	if [ -n "${VPN_DOMAIN:-}" ]; then echo "$VPN_DOMAIN"; return; fi
+	local a=${IP4:-}
+	[ "${NET4:-dhcp}" = dhcp ] && a=$(ip -4 -o addr show dev "$WAN_IF" 2>/dev/null | awk '{print $4}' | head -n1)
+	echo "${a%/*}"
+}
+
+# a key anyone could guess: short, or one of the usual ones
+weak_psk() {
+	[ ${#1} -lt 8 ] && return 0
+	case "${1,,}" in vpn*|password*|12345678*|qwerty*|softether*|ipsec*|secret*|changeme*) return 0 ;; esac
+	return 1
+}
+
 # ---- the live system ------------------------------------------------------------------
 
 live_disk() {
@@ -258,12 +273,22 @@ ask_domain() {
 		out=$(D "VPN domain" --form \
 "\nThe domain name of this VPN server. It must already point at this server\n\
 (A and/or AAAA record): Let's Encrypt checks it over HTTP on port 80.\n\
-The same name serves the WebGUI over HTTPS.\n\n\
-The certificate renews by itself and is loaded into SoftEther live.\n" 18 78 2 \
+The same name serves the WebGUI over HTTPS, and the certificate renews by\n\
+itself and is loaded into SoftEther live.\n\n\
+Leave it empty for a VPN by IP address with self-signed certificates.\n" 19 78 2 \
 			"Domain name:" 1 2 "${VPN_DOMAIN:-}" 1 20 52 253 \
 			"E-mail (optional):" 2 2 "${ACME_EMAIL:-}" 2 20 52 254) || return 1
 		{ read -r VPN_DOMAIN; read -r ACME_EMAIL; } <<< "$out"
 		VPN_DOMAIN=${VPN_DOMAIN,,}
+		if [ -z "$VPN_DOMAIN" ]; then
+			yesno "VPN domain" "\nNo domain: clients connect to this server by its IP address, and\n\
+SoftEther and the WebGUI use self-signed certificates. Clients then\n\
+warn about the certificate, or must be told to trust it.\n\n\
+A domain can be added later (WebGUI, System, Certificate).\n\n\
+Continue without a domain?" 15 78 || continue
+			ACME_EMAIL=
+			break
+		fi
 		valid_fqdn "$VPN_DOMAIN" || { msg "VPN domain" "\n'$VPN_DOMAIN' is not a domain name (vpn.example.com)."; continue; }
 		if [ "$VPN_DOMAIN" = "$HOSTNAME_NEW" ]; then
 			msg "VPN domain" "\nThe domain is the public name; the server's name ($HOSTNAME_NEW) is its\nown hostname. Use a full domain such as vpn.example.com."; continue
@@ -327,6 +352,8 @@ the same way. With No, clients share a normal /${VPN_IPV4#*/} subnet." 14 78; th
 
 ask_softether() {
 	STEP=6
+	# 00:00:5E:00:01:<VRID>, like a VRRP router: picked once, kept for good
+	VPN_TAP_MAC=${VPN_TAP_MAC:-$(printf '00:00:5E:00:01:%02X' $(( $(od -An -N1 -tu1 /dev/urandom) % 254 + 1 )))}
 	SE_PSK=${SE_PSK:-$(rand 12)}
 	while :; do
 		local out
@@ -344,7 +371,14 @@ A first VPN user is optional: add users later in Server Manager.\n" 19 78 6 \
 		VPN_USER=${VPN_USER// /}
 		[ ${#a} -ge 8 ] || { msg "SoftEther VPN" "\nThe admin password needs at least 8 characters."; continue; }
 		[ "$a" = "$b" ] || { msg "SoftEther VPN" "\nThe admin passwords do not match."; continue; }
-		[[ $SE_PSK =~ ^[A-Za-z0-9._@%+=-]{4,64}$ ]] || { msg "SoftEther VPN" "\nThe pre-shared key: 4 to 64 letters, digits or ._@%+=-"; continue; }
+		[[ $SE_PSK =~ ^[A-Za-z0-9._@%+=-]{1,64}$ ]] || { msg "SoftEther VPN" "\nThe pre-shared key: 1 to 64 letters, digits or ._@%+=-"; continue; }
+		if weak_psk "$SE_PSK"; then
+			yesno "IPsec pre-shared key" "\n\Z1Warning:\Zn '$SE_PSK' is an easy key to guess.\n\n\
+Every L2TP/IPsec client shares it. Whoever knows it can pose as this\n\
+server to those clients and read what they send; the user's own password\n\
+does not prevent that. A long random key is safer.\n\n\
+Use '$SE_PSK' anyway?" 15 78 || continue
+		fi
 		if [ -n "$VPN_USER" ]; then
 			valid_vpnuser "$VPN_USER" || { msg "SoftEther VPN" "\nThe VPN user name: letters, digits and ._-"; continue; }
 			[ -n "$VPN_USERPW" ] || { msg "SoftEther VPN" "\nThe VPN user needs a password."; continue; }
@@ -359,7 +393,7 @@ ask_webgui() {
 	while :; do
 		local out
 		out=$(D "WebGUI" --insecure --mixedform \
-"\nThe WebGUI: https://$VPN_DOMAIN:18080 (from the WAN side only; VPN clients\n\
+"\nThe WebGUI: https://$(server_addr):18080 (from the WAN side only; VPN clients\n\
 cannot reach this server). It has its own login.\n" 15 78 4 \
 			"Username:" 1 2 "${WEB_USER:-admin}" 1 20 46 32 0 \
 			"Password:" 2 2 "" 2 20 46 128 1 \
@@ -388,7 +422,7 @@ port_note() {
 	[ -n "$a" ] && is_private4 "$a" || return 0
 	echo "\n\Z3Note:\Zn $a is a private address: this server is behind NAT. Forward these\n\
 ports from the router to it:\n\
-  TCP 80 (Let's Encrypt), 443, 992, 1194, 5555 (SoftEther), 9122 (SSH),\n\
+  TCP $([ -n "$VPN_DOMAIN" ] && echo "80 (Let's Encrypt), ")443, 992, 1194, 5555 (SoftEther), 9122 (SSH),\n\
       18080 (WebGUI)\n\
   UDP 500, 4500 (L2TP/IPsec), 1194 (OpenVPN), and 1024-65535 for UDP\n\
       acceleration (or as many as the router allows)\n"
@@ -407,12 +441,13 @@ summary() {
   User (sudo)     $USERNAME${SSHID:+  + keys of $SSHID}\n\
   WAN             $WAN_IF  IPv4 $n4\n\
                           IPv6 $n6\n\
-  VPN domain      $VPN_DOMAIN  (Let's Encrypt${ACME_EMAIL:+, $ACME_EMAIL})\n\
+  VPN domain      $([ -n "$VPN_DOMAIN" ] && echo "$VPN_DOMAIN  (Let's Encrypt${ACME_EMAIL:+, $ACME_EMAIL})" || echo "none: by IP address, self-signed certificates")\n\
   VPN network     $VPN_IPV4  DHCP $VPN_DHCP_START - $VPN_DHCP_END\n\
                   $([ "$NET6" = off ] && echo "no IPv6" || echo "$VPN_IPV6 (NAT66)")\n\
   Clients         $([ "$VPN_PROXY_ARP" = 1 ] && echo "/32 with proxy-ARP" || echo "shared subnet"), $([ "$VPN_ISOLATION" = 1 ] && echo isolated || echo "can reach each other")\n\
-  SoftEther       IPsec key $SE_PSK${VPN_USER:+, first user $VPN_USER}\n\
-  WebGUI          https://$VPN_DOMAIN:18080  ($WEB_USER)\n\
+  SoftEther       IPsec key $SE_PSK$(weak_psk "$SE_PSK" && echo " (\Z1weak\Zn)")${VPN_USER:+, first user $VPN_USER}\n\
+  TAP interface   tap_vpn, MAC $VPN_TAP_MAC\n\
+  WebGUI          https://$(server_addr):18080  ($WEB_USER)\n\
   SSH             port 9122, no root login\n\
 $(port_note)" 30 82 >/dev/null
 	rc=$?
@@ -476,8 +511,9 @@ write_conf() {
 		conf_set VPN_IPV6 "$7"; conf_set VPN_IPV6_ENABLE "$8"; conf_set NAT66 "$8"
 		conf_set VPN_PROXY_ARP "$9"; conf_set VPN_ISOLATION "${10}"
 		[ -n "${11}" ] && conf_set VPN_DNS4 "${11}"
+		conf_set VPN_TAP_MAC "${12}"
 		' _ "$WAN_IF" "$VPN_DOMAIN" "$ACME_EMAIL" "$VPN_IPV4" "$VPN_DHCP_START" "$VPN_DHCP_END" \
-		"$VPN_IPV6" "$v6" "$VPN_PROXY_ARP" "$VPN_ISOLATION" "" >&2
+		"$VPN_IPV6" "$v6" "$VPN_PROXY_ARP" "$VPN_ISOLATION" "" "$VPN_TAP_MAC" >&2
 }
 
 write_secrets() {
@@ -490,8 +526,12 @@ write_secrets() {
 	)
 	printf '%s' "$WEB_PW" | in_target python3 -I /usr/share/rise/webgui/server.py --set-password "$WEB_USER" >&2
 	# a self-signed certificate for the WebGUI until Let's Encrypt has one
+	local cn=${VPN_DOMAIN:-$HOSTNAME_NEW} san="DNS:$HOSTNAME_NEW" addr
+	[ -n "$VPN_DOMAIN" ] && san="DNS:$VPN_DOMAIN,$san"
+	addr=$(VPN_DOMAIN='' server_addr)
+	[ -n "$addr" ] && san="$san,IP:$addr"
 	in_target openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
-		-subj "/CN=$VPN_DOMAIN" -addext "subjectAltName=DNS:$VPN_DOMAIN,DNS:$HOSTNAME_NEW" \
+		-subj "/CN=$cn" -addext "subjectAltName=$san" \
 		-keyout /etc/rise/secrets/webgui-selfsigned.key -out /etc/rise/secrets/webgui-selfsigned.crt >&2 2>&1
 	chmod 600 "$s"/*
 }
@@ -630,11 +670,10 @@ finish() {
 	D "Install complete" --yes-label "Reboot" --no-label "Shell" --yesno \
 "\n\ZbRISE Linux is installed.\Zn\n\n\
 Remove the installation medium, then reboot.\n\n\
-At the first boot SoftEther is configured and the certificate of\n\
-$VPN_DOMAIN is requested (port 80 must reach this server).\n\n\
-  WebGUI   https://$VPN_DOMAIN:18080\n\
-  SSH      ssh -p 9122 $USERNAME@$VPN_DOMAIN\n\
-  VPN      SoftEther Server Manager: $VPN_DOMAIN, port 443 or 5555\n\n\
+At the first boot SoftEther is configured$([ -n "$VPN_DOMAIN" ] && echo " and the certificate of\n$VPN_DOMAIN is requested (port 80 must reach this server)").\n\n\
+  WebGUI   https://$(server_addr):18080\n\
+  SSH      ssh -p 9122 $USERNAME@$(server_addr)\n\
+  VPN      SoftEther Server Manager: $(server_addr), port 443 or 5555\n\n\
 \Z3Silent by design. Secure by nature.\Zn" 20 76 >/dev/null
 	if [ $? = 0 ]; then
 		eject -m /cdrom >/dev/null 2>&1 || true

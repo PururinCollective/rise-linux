@@ -304,6 +304,7 @@ def overview():
                      "v6": read_file(f"{RUN}/fullcone6").strip() == "1"},
         "firstboot": os.path.exists("/var/lib/rise/firstboot-pending"),
         "domain": c.get("VPN_DOMAIN", ""),
+        "tap_mac": c.get("VPN_TAP_MAC", ""),
         "cert": cert_info(c.get("VPN_DOMAIN", "")),
         "conf": {k: c.get(k, "") for k in ("VPN_IPV4", "VPN_IPV6", "VPN_IPV6_ENABLE", "VPN_MTU",
                                            "NAT66", "NAT_FULLCONE", "VPN_PROXY_ARP", "VPN_ISOLATION",
@@ -675,10 +676,18 @@ def act_cert(d):
         mail = d.get("email", "")
         need(mail == "" or re.match(r"^[^@\s\"$`\\]+@[^@\s\"$`\\]+\.[^@\s\"$`\\]+$", mail), "e-mail address")
         write_conf({"VPN_DOMAIN": dom, "ACME_EMAIL": mail})
+        # port 80 opens only with a domain (Let's Encrypt's HTTP check)
+        run(["/usr/lib/rise/firewall", "reload"], timeout=30)
         a = "obtain"
     need(a in ("obtain", "renew"), "action")
     rc, out = run(["/usr/lib/rise/cert", a], timeout=180)
     return {"ok": rc == 0, "message": out[-800:] or ("done" if rc == 0 else "failed")}
+
+
+def weak_psk(psk):
+    low = psk.lower()
+    return len(psk) < 8 or low.startswith(("vpn", "password", "12345678", "qwerty", "softether",
+                                           "ipsec", "secret", "changeme"))
 
 
 def act_vpn(d):
@@ -690,9 +699,15 @@ def act_vpn(d):
         return {"ok": rc == 0, "message": "disconnected" if rc == 0 else "failed"}
     if a == "psk":
         psk = d.get("psk", "")
-        need(re.match(r"^[A-Za-z0-9._@%+=-]{4,64}$", psk), "pre-shared key: 4-64 of A-Z a-z 0-9 ._@%+=-")
+        need(re.match(r"^[A-Za-z0-9._@%+=-]{1,64}$", psk), "pre-shared key: 1-64 of A-Z a-z 0-9 ._@%+=-")
         rc, out = run(["/usr/lib/rise/softether-setup", "psk", psk], timeout=40)
-        return {"ok": rc == 0, "message": "IPsec key changed" if rc == 0 else out[-400:]}
+        if rc != 0:
+            return {"ok": False, "message": out[-400:]}
+        msg = "IPsec key changed"
+        if weak_psk(psk):
+            msg += (". Warning: it is easy to guess; whoever knows it can pose as this server"
+                    " to L2TP/IPsec clients. A long random key is safer.")
+        return {"ok": True, "message": msg}
     raise Bad("unknown action")
 
 
@@ -831,7 +846,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if u.path == "/api/logs":
                 return self.send_json(logs(q.get("unit", ["vpnserver"])[0], int(q.get("n", ["200"])[0])))
             if u.path == "/api/psk":
-                return self.send_json({"psk": read_file(f"{SECRETS}/ipsec-psk").strip()})
+                psk = read_file(f"{SECRETS}/ipsec-psk").strip()
+                return self.send_json({"psk": psk, "weak": weak_psk(psk)})
         except Bad as e:
             return self.send_json({"ok": False, "message": str(e)}, 400)
         return self.send_json({"error": "not found"}, 404)
