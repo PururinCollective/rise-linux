@@ -98,6 +98,8 @@ inchroot() {
 		"$@"
 }
 apt_in() { inchroot apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"; }
+# the squashfs stage empties apt's lists; a stage that installs refreshes them
+apt_ready() { [ -n "$(ls -A "$ROOT/var/lib/apt/lists" 2>/dev/null | grep -v '^lock$\|^partial$')" ] || apt_in update >>"$LOG" 2>&1; }
 
 kver() {
 	# the newest kernel in the chroot
@@ -247,6 +249,7 @@ stage_softether() {
 	fetch_softether
 	chroot_mount
 	local deps=(cmake make gcc pkg-config libssl-dev libsodium-dev libreadline-dev zlib1g-dev libncurses-dev)
+	apt_ready
 	apt_in install "${deps[@]}" >>"$LOG" 2>&1
 	rm -rf "$ROOT/usr/src/softether"
 	rsync -a --exclude='/.git/' "$SRC/softether/" "$ROOT/usr/src/softether/"
@@ -291,6 +294,7 @@ stage_fullcone() {
 	rm -rf "$d"
 	git clone -q "$FULLCONENAT_REPO" "$d"
 	git -C "$d" checkout -q "$FULLCONENAT_REF"
+	apt_ready
 	apt_in install libxtables-dev pkg-config "linux-headers-$k" >>"$LOG" 2>&1
 	inchroot dkms remove fullconenat/1.0 --all >/dev/null 2>&1 || true
 	rm -rf "$ROOT/usr/src/fullconenat-1.0"
