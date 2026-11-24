@@ -24,20 +24,27 @@ isolation() {
 		sleep 1
 	done
 	mac=$(tr 'a-f:' 'A-F-' < "/sys/class/net/$TAP_IF/address" 2>/dev/null)
-	# remove what this script added before (memo starts with rise-iso)
+	# what this script added before (memo starts with rise-iso)
 	local ids
 	ids=$(se @hub AccessList | awk -F, '/rise-iso/ {gsub(/"/, "", $1); print $1}')
-	for i in $ids; do se @hub AccessDelete "$i" >/dev/null; done
-	is_on "$VPN_ISOLATION" || { log "hub isolation off"; return 0; }
+	if ! is_on "$VPN_ISOLATION"; then
+		{ echo "Hub $VPN_HUB"; for i in $ids; do echo "AccessDelete $i"; done; } | se_batch >/dev/null
+		log "hub isolation off"
+		return 0
+	fi
 	[ -n "$mac" ] || { log "no MAC address for $TAP_IF, hub isolation not applied"; return 1; }
 	local ff=FF-FF-FF-FF-FF-FF any="/SRCUSERNAME: /DESTUSERNAME: /SRCIP:0.0.0.0/0 /DESTIP:0.0.0.0/0 /PROTOCOL:0 /SRCPORT: /DESTPORT: /TCPSTATE:"
 	# unicast only to and from this server; broadcast and IPv6 multicast for
 	# ARP, DHCP and neighbour discovery; everything else (client to client) dropped
-	se @hub AccessAdd pass /MEMO:rise-iso-to-gw /PRIORITY:10 /SRCMAC: /DESTMAC:"$mac/$ff" $any >/dev/null
-	se @hub AccessAdd pass /MEMO:rise-iso-from-gw /PRIORITY:11 /SRCMAC:"$mac/$ff" /DESTMAC: $any >/dev/null
-	se @hub AccessAdd pass /MEMO:rise-iso-bcast /PRIORITY:12 /SRCMAC: /DESTMAC:"$ff/$ff" $any >/dev/null
-	se @hub AccessAdd pass /MEMO:rise-iso-mcast6 /PRIORITY:13 /SRCMAC: /DESTMAC:"33-33-00-00-00-00/FF-FF-00-00-00-00" $any >/dev/null
-	se @hub AccessAdd discard /MEMO:rise-iso-drop /PRIORITY:1000 /SRCMAC: /DESTMAC: $any >/dev/null
+	se_batch <<-EOF | grep -i "error" >&2
+	Hub $VPN_HUB
+	$(for i in $ids; do echo "AccessDelete $i"; done)
+	AccessAdd pass /MEMO:rise-iso-to-gw /PRIORITY:10 /SRCMAC: /DESTMAC:$mac/$ff $any
+	AccessAdd pass /MEMO:rise-iso-from-gw /PRIORITY:11 /SRCMAC:$mac/$ff /DESTMAC: $any
+	AccessAdd pass /MEMO:rise-iso-bcast /PRIORITY:12 /SRCMAC: /DESTMAC:$ff/$ff $any
+	AccessAdd pass /MEMO:rise-iso-mcast6 /PRIORITY:13 /SRCMAC: /DESTMAC:33-33-00-00-00-00/FF-FF-00-00-00-00 $any
+	AccessAdd discard /MEMO:rise-iso-drop /PRIORITY:1000 /SRCMAC: /DESTMAC: $any
+	EOF
 	log "hub isolation on (gateway MAC $mac)"
 }
 
@@ -79,48 +86,48 @@ firstboot() {
 	systemctl start rise-vpnserver.service
 	SE_PW='' se_wait 90 || se_wait 5 || die "SoftEther does not answer on localhost:$(se_admin_port)"
 	# a fresh server has no password; a second run already has it
-	SE_PW='' se ServerPasswordSet "$pw" >/dev/null 2>&1 || true
+	se About >/dev/null 2>&1 || SE_PW='' se ServerPasswordSet "$pw" >/dev/null 2>&1 || true
 	se About >/dev/null || die "cannot log in to SoftEther with the stored admin password"
 
-	local hubs
+	local hubs icmp=no dns=no u='' p=''
 	hubs=$(se HubList)
-	if [ "$VPN_HUB" != DEFAULT ] && printf '%s\n' "$hubs" | csv_has DEFAULT; then
-		se HubDelete DEFAULT >/dev/null
-	fi
-	printf '%s\n' "$hubs" | csv_has "$VPN_HUB" || se HubCreate "$VPN_HUB" /PASSWORD:"$(rand 32)" >/dev/null
-	se BridgeList | grep -q "\"$VPN_TAP\"\|,$VPN_TAP," || \
-		se BridgeCreate "$VPN_HUB" /DEVICE:"$VPN_TAP" /TAP:yes >/dev/null
-
-	se IPsecEnable /L2TP:yes /L2TPRAW:no /ETHERIP:no /PSK:"$psk" /DEFAULTHUB:"$VPN_HUB" >/dev/null
-	se ProtoOptionsSet OpenVPN /NAME:Enabled /VALUE:yes >/dev/null
-	se ProtoOptionsSet SSTP /NAME:Enabled /VALUE:yes >/dev/null
-	local icmp=no dns=no
 	is_on "$SOFTETHER_VPN_OVER_ICMP" && icmp=yes
 	is_on "$SOFTETHER_VPN_OVER_DNS" && dns=yes
-	se VpnOverIcmpDnsEnable /ICMP:$icmp /DNS:$dns >/dev/null
-	se KeepDisable >/dev/null
-	se VpnAzureSetEnable no >/dev/null 2>&1 || true
-
-	se @hub SecureNatDisable >/dev/null
-	se @hub LogDisable packet >/dev/null
-	se @hub SetMaxSession 0 >/dev/null 2>&1 || true
-
-	# the first VPN user, if the installer was given one
-	if [ -r "$RISE_SECRETS/vpn-first-user" ]; then
-		local u p
-		IFS=: read -r u p < "$RISE_SECRETS/vpn-first-user"
-		if [ -n "$u" ] && [ -n "$p" ]; then
-			se @hub UserCreate "$u" /GROUP:none /REALNAME:none /NOTE:"created by the installer" >/dev/null 2>&1 || true
-			se @hub UserPasswordSet "$u" /PASSWORD:"$p" >/dev/null && log "VPN user $u created"
+	[ -r "$RISE_SECRETS/vpn-first-user" ] && IFS=: read -r u p < "$RISE_SECRETS/vpn-first-user"
+	# one session for all of it (see se_batch); the output goes to the journal
+	{
+		if [ "$VPN_HUB" != DEFAULT ] && printf '%s\n' "$hubs" | csv_has DEFAULT; then
+			echo "HubDelete DEFAULT"
 		fi
+		printf '%s\n' "$hubs" | csv_has "$VPN_HUB" || echo "HubCreate $VPN_HUB /PASSWORD:$(rand 32)"
+		echo "BridgeCreate $VPN_HUB /DEVICE:$VPN_TAP /TAP:yes"
+		echo "IPsecEnable /L2TP:yes /L2TPRAW:no /ETHERIP:no /PSK:$psk /DEFAULTHUB:$VPN_HUB"
+		echo "ProtoOptionsSet OpenVPN /NAME:Enabled /VALUE:yes"
+		echo "ProtoOptionsSet SSTP /NAME:Enabled /VALUE:yes"
+		echo "VpnOverIcmpDnsEnable /ICMP:$icmp /DNS:$dns"
+		echo "KeepDisable"
+		echo "VpnAzureSetEnable no"
+		echo "Hub $VPN_HUB"
+		echo "SecureNatDisable"
+		echo "LogDisable packet"
+		if [ -n "$u" ] && [ -n "$p" ]; then
+			echo "UserCreate $u /GROUP:none /REALNAME:none /NOTE:none"
+			echo "UserPasswordSet $u /PASSWORD:$p"
+		fi
+	} | se_batch | grep -E "command - |Error occurred|^[A-Z][a-z].* (has|have) " | grep -v "^vpncmd command" | sed 's/^/vpncmd: /' >&2
+	if [ -n "$u" ]; then
+		se @hub UserList | grep -q "\"$u\"\|^$u," && log "VPN user $u created" || log "VPN user $u was not created"
 		shred -u "$RISE_SECRETS/vpn-first-user" 2>/dev/null || rm -f "$RISE_SECRETS/vpn-first-user"
 	fi
 
 	isolation || true
 	cert || true
 
-	# settings vpncmd has no command for
-	se Flush >/dev/null 2>&1 || true
+	# settings vpncmd has no command for: only once the rest is on disk, or
+	# the restart would come back without it
+	se Flush >/dev/null || { sleep 10; se Flush >/dev/null; } || die "SoftEther did not save its configuration"
+	# the file has CRLF line ends
+	grep -q "declare $VPN_HUB[[:space:]]*\$" "$SE_CONFIG" || die "the saved configuration has no hub $VPN_HUB"
 	systemctl stop rise-vpnserver.service
 	patch_config
 	rm -f "$RISE_STATE/firstboot-pending"

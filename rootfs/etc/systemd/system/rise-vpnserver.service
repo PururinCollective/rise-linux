@@ -14,8 +14,9 @@ RestartSec=3
 Nice=-10
 TasksMax=infinity
 LimitNOFILE=1048576
-KillMode=mixed
-TimeoutStopSec=20
+# SIGTERM to every process of the unit (not mixed): the server process
+# saves its configuration when it gets it
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

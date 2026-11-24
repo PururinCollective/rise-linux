@@ -76,8 +76,29 @@ se() {
 		hub=(/ADMINHUB:"$VPN_HUB")
 	fi
 	printf '%s\n' "$*" > "$f"
-	out=$("$VPNCMD" /SERVER localhost:"$(se_admin_port)" ${pw:+/PASSWORD:"$pw"} "${hub[@]}" \
-		/CSV /IN:"$f" 2>&1)
+	# /PASSWORD: always (empty for a fresh server) and no terminal input, so
+	# vpncmd never stops to ask for a password
+	# a wrong password makes vpncmd retry forever: hence the timeout
+	out=$(timeout 30 "$VPNCMD" /SERVER localhost:"$(se_admin_port)" /PASSWORD:"$pw" "${hub[@]}" \
+		/CSV /IN:"$f" 2>&1 </dev/null)
+	rc=$?
+	rm -f "$f"
+	printf '%s\n' "$out"
+	return $rc
+}
+
+# se_batch: the commands on stdin, one per line, in ONE vpncmd session.
+# SoftEther's DoS protection refuses a burst of admin connections from one
+# address (error 152, "TLS handshake has failed"), so a script that has many
+# commands to run sends them together. vpncmd runs every line, also after
+# one that fails; "Hub NAME" selects the hub for the lines after it.
+se_batch() {
+	local f out rc pw
+	pw=${SE_PW-$(se_password)}
+	f=$(mktemp "$RISE_RUN/vpncmd.XXXXXX")
+	chmod 600 "$f"
+	cat > "$f"
+	out=$(timeout 120 "$VPNCMD" /SERVER localhost:"$(se_admin_port)" /PASSWORD:"$pw" /IN:"$f" 2>&1 </dev/null)
 	rc=$?
 	rm -f "$f"
 	printf '%s\n' "$out"
@@ -87,9 +108,11 @@ se() {
 # wait until the server answers on its admin port
 se_wait() {
 	local i
-	for i in $(seq 1 "${1:-60}"); do
-		se About >/dev/null 2>&1 && return 0
-		sleep 1
+	# the port answering is enough; logging in here would count against
+	# SoftEther's DoS protection, and fail on purpose with a wrong password
+	for i in $(seq 1 "${1:-30}"); do
+		(exec 3<>"/dev/tcp/127.0.0.1/$(se_admin_port)") 2>/dev/null && return 0
+		sleep 2
 	done
 	return 1
 }

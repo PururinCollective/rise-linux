@@ -151,7 +151,8 @@ def login_failed(ip):
 
 def run(args, timeout=30, input=None):
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, input=input)
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                           input=input, stdin=None if input is not None else subprocess.DEVNULL)
         return p.returncode, (p.stdout + p.stderr).strip()
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, str(e)
@@ -176,12 +177,14 @@ def vpncmd(command, hub=False, timeout=20):
         rc, out = run(args, timeout=timeout)
     finally:
         os.unlink(path)
-    rows = []
     import csv
     import io
-    for row in csv.reader(io.StringIO(out)):
-        rows.append(row)
-    return rc, rows
+    # before the CSV, vpncmd says where its commands come from and echoes the
+    # prompt with the command; neither is part of the table
+    lines = [l for l in out.splitlines()
+             if l.strip() and not l.startswith("The commands written")
+             and not re.match(r"^VPN Server[^>]*>", l)]
+    return rc, list(csv.reader(io.StringIO("\n".join(lines))))
 
 
 def systemctl_state(unit):
