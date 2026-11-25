@@ -242,6 +242,19 @@ fetch_softether() {
 		git -C "$dst" -c safe.directory='*' submodule update --init --recursive --depth 1 -- "${missing[@]}" >>"$LOG" 2>&1 || \
 			git -C "$dst" -c safe.directory='*' submodule update --init --recursive -- "${missing[@]}" >>"$LOG" 2>&1
 	fi
+	# RISE's own fixes (patches/softether), skipped when the source has them
+	local p
+	for p in "$TOP"/patches/softether/*.patch; do
+		[ -e "$p" ] || continue
+		if patch -d "$dst" -p1 -R --dry-run -s -f <"$p" >/dev/null 2>&1; then
+			info "  patch $(basename "$p"): already in the source"
+		elif patch -d "$dst" -p1 --dry-run -s -f <"$p" >>"$LOG" 2>&1; then
+			patch -d "$dst" -p1 -s -f <"$p" >>"$LOG" 2>&1
+			info "  patch $(basename "$p")"
+		else
+			die "patch $(basename "$p") does not apply to the SoftEther source"
+		fi
+	done
 }
 
 stage_softether() {

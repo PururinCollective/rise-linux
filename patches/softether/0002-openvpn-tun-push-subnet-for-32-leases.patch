@@ -1,0 +1,67 @@
+OpenVPN TUN: push a subnet that holds the gateway when the lease is /32
+
+With a /32 lease (netmask 255.255.255.255) the push was "ifconfig <ip>
+255.255.255.255, route-gateway <gw>, route <gw> 255.255.255.255 0.0.0.0", and
+OpenVPN clients cannot route through a gateway outside their subnet (Linux:
+"ERROR: Linux route add command failed"). In TUN mode the netmask only tells
+the client what is on-link, since everything goes through the tunnel to the
+server, so push the smallest subnet holding the client and the gateway (for
+10.255.255.190 and 10.255.255.1: /24) and leave out on-link routes it covers.
+Client isolation is unaffected: it is enforced in the hub and on the server.
+
+--- a/src/Cedar/Proto_OpenVPN.c
++++ b/src/Cedar/Proto_OpenVPN.c
+@@ -2424,6 +2424,8 @@
+ 									char ip_wins1[64];
+ 									char ip_wins2[64];
+ 									char ip_defgw[64];
++									UINT push_mask;
++									UINT push_mask_len = 32;
+ 
+ 									ClearStr(ip_dns1, sizeof(ip_dns1));
+ 									ClearStr(ip_dns2, sizeof(ip_dns2));
+@@ -2434,8 +2436,28 @@
+ 									IPToStr32(ip_client, sizeof(ip_client),
+ 									          cao->ClientAddress);
+ 
++									// A /32 lease (netmask 255.255.255.255) leaves the gateway outside
++									// the client's subnet, and OpenVPN clients cannot route through it
++									// (Linux: "route add command failed"). In TUN mode the netmask only
++									// tells the client what is on-link, and everything goes through the
++									// tunnel to this server anyway, so push the smallest subnet that holds
++									// the gateway too. Isolation stays where it is, in the hub.
++									push_mask = cao->SubnetMask;
++									if (cao->SubnetMask == 0xffffffff && cao->Gateway != 0 && cao->Gateway != cao->ClientAddress)
++									{
++										UINT diff = Endian32(cao->ClientAddress) ^ Endian32(cao->Gateway);
++										UINT len = 0;
++
++										while (len < 32 && (diff & (0x80000000 >> len)) == 0)
++										{
++											len++;
++										}
++										push_mask_len = len;
++										push_mask = Endian32(len == 0 ? 0 : (0xffffffff << (32 - len)));
++									}
++
+ 									IPToStr32(ip_subnet_mask, sizeof(ip_subnet_mask),
+-									          cao->SubnetMask);
++									          push_mask);
+ 
+ 									Format(l3_options, sizeof(l3_options),
+ 									       ",topology subnet");
+@@ -2546,6 +2568,14 @@
+ 										{
+ 											DHCP_CLASSLESS_ROUTE *r = &cao->ClasslessRoute.Entries[i];
+ 
++											if (r->Exists && push_mask_len < 32 && IsZeroIP(&r->Gateway) &&
++											        r->SubnetMaskLen >= push_mask_len &&
++											        (IPToUINT(&r->Network) & push_mask) == (cao->ClientAddress & push_mask))
++											{
++												// an on-link route inside the widened subnet: the subnet covers it
++												continue;
++											}
++
+ 											if (r->Exists)
+ 											{
+ 												Format(l3_options, sizeof(l3_options),
