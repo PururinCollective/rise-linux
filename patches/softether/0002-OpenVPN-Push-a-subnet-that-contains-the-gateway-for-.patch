@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anime4000 <hitoha4000@outlook.com>
+Date: Wed, 25 Nov 2026 20:53:33 +0800
+Subject: [PATCH 2/2] OpenVPN: Push a subnet that contains the gateway for a
+ /32 DHCP lease
+
+For a /32 DHCP lease (netmask 255.255.255.255), the TUN mode pushed
+"ifconfig <ip> 255.255.255.255", "route-gateway <gateway>" and "route
+<gateway> 255.255.255.255 0.0.0.0". The default gateway is outside the
+subnet of the client, and the OpenVPN client cannot add the routes
+through it (Linux: "ERROR: Linux route add command failed").
+
+In the TUN mode, the netmask specifies only the on-link range of the
+client, and all packets are sent through the tunnel. For a /32 lease,
+this commit pushes the smallest subnet that contains the client address
+and the default gateway (10.255.255.190 and 10.255.255.1: /24), and does
+not push the on-link routes in that subnet. Isolation between clients is
+not changed: it is done in the server. Other leases are not affected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Cedar/Proto_OpenVPN.c | 33 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/src/Cedar/Proto_OpenVPN.c b/src/Cedar/Proto_OpenVPN.c
+index 80b5b81a..e11065bb 100644
+--- a/src/Cedar/Proto_OpenVPN.c
++++ b/src/Cedar/Proto_OpenVPN.c
+@@ -2424,6 +2424,8 @@ void OvsRecvPacket(OPENVPN_SERVER *s, LIST *recv_packet_list, UINT protocol)
+ 									char ip_wins1[64];
+ 									char ip_wins2[64];
+ 									char ip_defgw[64];
++									UINT push_mask;
++									UINT push_mask_len = 32;
+ 
+ 									ClearStr(ip_dns1, sizeof(ip_dns1));
+ 									ClearStr(ip_dns2, sizeof(ip_dns2));
+@@ -2434,8 +2436,29 @@ void OvsRecvPacket(OPENVPN_SERVER *s, LIST *recv_packet_list, UINT protocol)
+ 									IPToStr32(ip_client, sizeof(ip_client),
+ 									          cao->ClientAddress);
+ 
++									// With a /32 lease (netmask 255.255.255.255), the default gateway is
++									// outside the subnet of the client, and the OpenVPN client cannot add
++									// the routes through it. In the TUN mode, the netmask specifies only
++									// the on-link range of the client, and all packets are sent through
++									// the tunnel. The smallest subnet that contains the client address
++									// and the default gateway is pushed instead. Isolation between
++									// clients is not changed: it is done in the server.
++									push_mask = cao->SubnetMask;
++									if (cao->SubnetMask == 0xffffffff && cao->Gateway != 0 && cao->Gateway != cao->ClientAddress)
++									{
++										UINT diff = Endian32(cao->ClientAddress) ^ Endian32(cao->Gateway);
++										UINT len = 0;
++
++										while (len < 32 && (diff & (0x80000000 >> len)) == 0)
++										{
++											len++;
++										}
++										push_mask_len = len;
++										push_mask = Endian32(len == 0 ? 0 : (0xffffffff << (32 - len)));
++									}
++
+ 									IPToStr32(ip_subnet_mask, sizeof(ip_subnet_mask),
+-									          cao->SubnetMask);
++									          push_mask);
+ 
+ 									Format(l3_options, sizeof(l3_options),
+ 									       ",topology subnet");
+@@ -2546,6 +2569,14 @@ void OvsRecvPacket(OPENVPN_SERVER *s, LIST *recv_packet_list, UINT protocol)
+ 										{
+ 											DHCP_CLASSLESS_ROUTE *r = &cao->ClasslessRoute.Entries[i];
+ 
++											if (r->Exists && push_mask_len < 32 && IsZeroIP(&r->Gateway) &&
++											        r->SubnetMaskLen >= push_mask_len &&
++											        (IPToUINT(&r->Network) & push_mask) == (cao->ClientAddress & push_mask))
++											{
++												// On-link route in the pushed subnet: not pushed
++												continue;
++											}
++
+ 											if (r->Exists)
+ 											{
+ 												Format(l3_options, sizeof(l3_options),

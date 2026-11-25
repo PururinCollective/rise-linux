@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anime4000 <hitoha4000@outlook.com>
+Date: Wed, 25 Nov 2026 20:53:33 +0800
+Subject: [PATCH 1/2] IPC: Fix the next hop and the ARP learning for a /32 DHCP
+ lease
+
+The DHCP server can assign a /32 address (netmask 255.255.255.255) with
+the classless static routes (DHCP options 121 and 249) "<gateway>/32 via
+0.0.0.0" and "0.0.0.0/0 via <gateway>". This configuration is used to
+isolate the VPN clients from each other.
+
+IPC is used by the L2TP, SSTP, OpenVPN TUN mode and EtherIP sessions. IPC
+did not support this configuration:
+
+- For an on-link route (gateway 0.0.0.0), IPCSendIPv4() used 0.0.0.0 as
+  the next hop and dropped the packet. Packets to the default gateway
+  were not sent.
+- IPCAssociateOnArpTable() does not learn an address outside the subnet
+  of the client. With a /32 subnet, the ARP entry of the default gateway
+  was not learned, and no IPv4 packet was sent.
+
+This commit adds IPCIsOnLink4(). The subnet, the default gateway, the
+gateway of each classless route and the destination of each on-link
+route are on-link. IPCAssociateOnArpTable() uses IPCIsOnLink4(), and
+IPCSendIPv4() sends a packet for an on-link route to the destination
+address. A lease with a normal subnet is not affected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Cedar/IPC.c | 44 +++++++++++++++++++++++++++++++++++++++++++-
+ src/Cedar/IPC.h |  1 +
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/src/Cedar/IPC.c b/src/Cedar/IPC.c
+index e3f43213..dffbf1ed 100644
+--- a/src/Cedar/IPC.c
++++ b/src/Cedar/IPC.c
+@@ -1282,6 +1282,43 @@ void IPCProcessArp(IPC *ipc, BLOCK *b)
+ 	}
+ }
+ 
++// Check whether the specified IPv4 address is on-link.
++// The subnet, the default gateway, the gateway of each classless route and the
++// destination of each on-link route (gateway 0.0.0.0) are on-link. With a /32
++// lease (netmask 255.255.255.255), the default gateway is outside the subnet.
++bool IPCIsOnLink4(IPC *ipc, IP *ip)
++{
++	UINT i;
++	DHCP_CLASSLESS_ROUTE *r;
++	// Validate arguments
++	if (ipc == NULL || ip == NULL)
++	{
++		return false;
++	}
++	if (IsInSameNetwork4(ip, &ipc->ClientIPAddress, &ipc->SubnetMask))
++	{
++		return true;
++	}
++	if (IsZeroIP(&ipc->DefaultGateway) == false && CmpIpAddr(&ipc->DefaultGateway, ip) == 0)
++	{
++		return true;
++	}
++	if (ipc->ClasslessRoute.NumExistingRoutes == 0)
++	{
++		return false;
++	}
++	for (i = 0; i < MAX_DHCP_CLASSLESS_ROUTE_ENTRIES; i++)
++	{
++		r = &ipc->ClasslessRoute.Entries[i];
++		if (r->Exists && IsZeroIP(&r->Gateway) == false && CmpIpAddr(&r->Gateway, ip) == 0)
++		{
++			return true;
++		}
++	}
++	r = GetBestClasslessRoute(&ipc->ClasslessRoute, ip);
++	return (r != NULL && IsZeroIP(&r->Gateway));
++}
++
+ // Associate the MAC address and IP address on the ARP table
+ void IPCAssociateOnArpTable(IPC *ipc, IP *ip, UCHAR *mac_address)
+ {
+@@ -1295,7 +1332,7 @@ void IPCAssociateOnArpTable(IPC *ipc, IP *ip, UCHAR *mac_address)
+ 	{
+ 		return;
+ 	}
+-	if (IsInSameNetwork4(ip, &ipc->ClientIPAddress, &ipc->SubnetMask) == false)
++	if (IPCIsOnLink4(ipc, ip) == false)
+ 	{
+ 		// Not to learn the IP address of outside the subnet
+ 		return;
+@@ -1764,6 +1801,11 @@ void IPCSendIPv4(IPC *ipc, void *data, UINT size)
+ 		{
+ 			Copy(&ip_dst_local, &ipc->DefaultGateway, sizeof(IP));
+ 		}
++		else if (IsZeroIP(&r->Gateway))
++		{
++			// On-link route (gateway 0.0.0.0): the destination is the next hop
++			Copy(&ip_dst_local, &ip_dst, sizeof(IP));
++		}
+ 		else
+ 		{
+ 			Copy(&ip_dst_local, &r->Gateway, sizeof(IP));
+diff --git a/src/Cedar/IPC.h b/src/Cedar/IPC.h
+index c40f5cbe..c9483a65 100644
+--- a/src/Cedar/IPC.h
++++ b/src/Cedar/IPC.h
+@@ -217,6 +217,7 @@ void IPCSendIPv4WithDestMacAddr(IPC *ipc, void *data, UINT size, UCHAR *dest_mac
+ void IPCFlushArpTable(IPC *ipc);
+ void IPCFlushArpTableEx(IPC *ipc, UINT64 now);
+ void IPCProcessArp(IPC *ipc, BLOCK *b);
++bool IPCIsOnLink4(IPC *ipc, IP *ip);
+ void IPCAssociateOnArpTable(IPC *ipc, IP *ip, UCHAR *mac_address);
+ 
+ 
