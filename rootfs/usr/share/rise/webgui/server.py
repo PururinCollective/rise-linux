@@ -160,6 +160,13 @@ def run(args, timeout=30, input=None):
 
 def vpncmd(command, hub=False, timeout=20):
     """One vpncmd command as the server administrator, CSV output parsed."""
+    rc, rows, _ = vpncmd_text(command, hub, timeout)
+    return rc, rows
+
+
+def vpncmd_text(command, hub=False, timeout=20):
+    """vpncmd commands (one per line, one admin session: SoftEther refuses
+    bursts of admin logins), as (rc, CSV rows, text)."""
     c = read_conf()
     try:
         pw = open(f"{SECRETS}/softether-admin").read().strip()
@@ -184,7 +191,21 @@ def vpncmd(command, hub=False, timeout=20):
     lines = [l for l in out.splitlines()
              if l.strip() and not l.startswith("The commands written")
              and not re.match(r"^VPN Server[^>]*>", l)]
-    return rc, list(csv.reader(io.StringIO("\n".join(lines))))
+    return rc, list(csv.reader(io.StringIO("\n".join(lines)))), "\n".join(lines)
+
+
+def vpncmd_error(text):
+    """The reason in vpncmd's output ("Error occurred. (Error code: 51)" and the line after)."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    for i, l in enumerate(lines):
+        if l.startswith("Error occurred"):
+            return " ".join(lines[i:i + 2])
+    return lines[-1] if lines else "SoftEther did not answer"
+
+
+def vq(v):
+    """A vpncmd parameter value: quoted (spaces), "" for a quote."""
+    return '"' + v.replace('"', '""') + '"'
 
 
 def systemctl_state(unit):
@@ -323,12 +344,25 @@ def sessions():
     return {"ok": True, "columns": head, "sessions": out}
 
 
+def se_time(v):
+    """SoftEther's "2026-12-02 (Wed) 16:00:00" (server local time) as a UNIX time, else None."""
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2}) \(\w+\) (\d{2}):(\d{2}):(\d{2})$", (v or "").strip())
+    if not m:
+        return None
+    y, mo, d, hh, mi, ss = map(int, m.groups())
+    return int(time.mktime((y, mo, d, hh, mi, ss, 0, 0, -1)))
+
+
 def vpn_users():
     rc, rows = vpncmd("UserList", hub=True)
     if rc != 0 or not rows:
         return {"ok": False, "users": []}
     head = rows[0]
-    return {"ok": True, "columns": head, "users": [dict(zip(head, r)) for r in rows[1:] if len(r) == len(head)]}
+    users = [dict(zip(head, r)) for r in rows[1:] if len(r) == len(head)]
+    for u in users:
+        u["expires_ts"] = se_time(u.get("Expiration Date"))
+    return {"ok": True, "columns": head, "users": users, "now": int(time.time()),
+            "tz": time.strftime("%Z")}
 
 
 def leases():
@@ -542,7 +576,11 @@ def network_get():
     c = read_conf()
     wan = c.get("WAN_IF", "eth0")
     text = read_file(NETPLAN)
-    cfg = {"iface": wan, "v4": "dhcp", "v6": "auto", "addr4": "", "gw4": "", "addr6": "", "gw6": "", "dns": ""}
+    cfg = {"iface": wan, "v4": "dhcp", "v6": "auto", "addr4": "", "gw4": "", "addr6": "", "gw6": "", "dns": "",
+           "token6": ""}
+    m = re.search(r'ipv6-address-token:\s*"?([0-9a-fA-F:]+)"?', text)
+    if m:
+        cfg["token6"] = m.group(1)
     if "dhcp4: false" in text:
         cfg["v4"] = "static"
     if "link-local: [ ipv4 ]" in text:
@@ -576,6 +614,13 @@ def act_network(d):
         need(is_ip(d.get("gw6", ""), 6), "IPv6 gateway")
         addrs.append(d["addr6"]); routes.append(d["gw6"])
     need(v4 == "dhcp" or dns, "a static IPv4 needs DNS servers")
+    token6 = (d.get("token6") or "").strip() if v6 == "auto" else ""
+    if token6:
+        try:
+            t = int(ipaddress.IPv6Address(token6))
+        except ValueError:
+            t = 0
+        need(0 < t < 2 ** 64, "IPv6 token: the interface part only, for example ::45")
     mac = addresses(wan).get("mac", "")
     y = ["# written by the RISE WebGUI", "network:", "  version: 2", "  renderer: networkd",
          "  ethernets:", f"    {wan}:"]
@@ -584,6 +629,8 @@ def act_network(d):
     y.append(f"      dhcp4: {'true' if v4 == 'dhcp' else 'false'}")
     if v6 == "auto":
         y += ["      dhcp6: true", "      accept-ra: true"]
+        if token6:
+            y.append(f'      ipv6-address-token: "{token6}"')
     elif v6 == "static":
         y += ["      dhcp6: false", "      accept-ra: false"]
     else:
@@ -709,6 +756,92 @@ def act_vpn(d):
             msg += (". Warning: it is easy to guess; whoever knows it can pose as this server"
                     " to L2TP/IPsec clients. A long random key is safer.")
         return {"ok": True, "message": msg}
+    raise Bad("unknown action")
+
+
+RE_VPNUSER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,62}$")
+RE_TEXT = re.compile(r"^[^\x00-\x1f\x7f\"]{0,127}$")
+RE_VPNPASS = re.compile(r"^[^\x00-\x1f\x7f\"]{1,255}$")
+
+
+def expires_arg(e):
+    """{"mode": "never"} | {"mode": "days", "days": N} | {"mode": "at", "at": UNIX time}
+    as UserExpiresSet's /EXPIRES (server local time)."""
+    e = e or {}
+    mode = e.get("mode", "never")
+    if mode == "never":
+        return "none", None
+    if mode == "days":
+        days = e.get("days")
+        need(isinstance(days, int) and 1 <= days <= 3650, "days: 1 to 3650")
+        ts = int(time.time()) + days * 86400
+    elif mode == "at":
+        ts = e.get("at")
+        need(isinstance(ts, (int, float)), "expiry date")
+        ts = int(ts)
+        need(ts > time.time(), "the expiry date is in the past")
+        need(ts < time.time() + 50 * 365 * 86400, "the expiry date is too far away")
+    else:
+        raise Bad("expiry")
+    return time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(ts)), ts
+
+
+def pass_note(pw):
+    return " (a short password: easy to guess)" if len(pw) < 8 else ""
+
+
+def act_vpnuser(d):
+    """VPN users of the hub: add, delete, password, expiry."""
+    a = d.get("action")
+    name = d.get("name", "")
+    need(isinstance(name, str) and RE_VPNUSER.match(name),
+         "user name: 1-63 of A-Z a-z 0-9 ._@- (starting with a letter or digit)")
+    if a == "add":
+        pw = d.get("password", "")
+        realname = (d.get("realname") or "").strip()
+        note = (d.get("note") or "").strip()
+        need(isinstance(pw, str) and RE_VPNPASS.match(pw), "password: 1-255 characters, no double quote")
+        need(RE_TEXT.match(realname), "full name: up to 127 characters, no double quote")
+        need(RE_TEXT.match(note), "description: up to 127 characters, no double quote")
+        exp, ts = expires_arg(d.get("expires"))
+        rc, rows = vpncmd("UserList", hub=True)
+        need(rc == 0, "SoftEther did not answer")
+        need(not any(r and r[0].lower() == name.lower() for r in rows[1:]), f"{name} exists already")
+        # UserCreate gives the user a random password, so a failure halfway
+        # never leaves an account anyone can log in to
+        cmds = [f"UserCreate {name} /GROUP:none /REALNAME:{vq(realname or 'none')} /NOTE:{vq(note or 'none')}",
+                f"UserPasswordSet {name} /PASSWORD:{vq(pw)}"]
+        if ts:
+            cmds.append(f"UserExpiresSet {name} /EXPIRES:{vq(exp)}")
+        rc, _, out = vpncmd_text("\n".join(cmds), hub=True)
+        if rc != 0:
+            return {"ok": False, "message": f"could not add {name}: {vpncmd_error(out)}"}
+        return {"ok": True, "message": f"{name} added" + (f", expires {exp} {time.strftime('%Z')}" if ts else "") + pass_note(pw)}
+    if a == "delete":
+        rc, _, out = vpncmd_text(f"UserDelete {name}", hub=True)
+        if rc != 0:
+            return {"ok": False, "message": vpncmd_error(out)}
+        # whoever is still connected as this user goes too
+        rc, rows = vpncmd("SessionList", hub=True)
+        if rc == 0 and rows:
+            head = rows[0]
+            gone = [r[0] for r in rows[1:] if len(r) == len(head) and dict(zip(head, r)).get("User Name") == name]
+            if gone:
+                vpncmd_text("\n".join(f"SessionDisconnect {s}" for s in gone), hub=True)
+        return {"ok": True, "message": f"{name} deleted"}
+    if a == "password":
+        pw = d.get("password", "")
+        need(isinstance(pw, str) and RE_VPNPASS.match(pw), "password: 1-255 characters, no double quote")
+        rc, _, out = vpncmd_text(f"UserPasswordSet {name} /PASSWORD:{vq(pw)}", hub=True)
+        if rc != 0:
+            return {"ok": False, "message": vpncmd_error(out)}
+        return {"ok": True, "message": f"password of {name} changed" + pass_note(pw)}
+    if a == "expires":
+        exp, ts = expires_arg(d.get("expires"))
+        rc, _, out = vpncmd_text(f"UserExpiresSet {name} /EXPIRES:{vq(exp)}", hub=True)
+        if rc != 0:
+            return {"ok": False, "message": vpncmd_error(out)}
+        return {"ok": True, "message": f"{name} expires {exp} {time.strftime('%Z')}" if ts else f"{name} never expires"}
     raise Bad("unknown action")
 
 
@@ -891,7 +1024,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             d = self.body_json()
             routes = {"/api/settings": act_settings, "/api/portfwd": act_portfwd, "/api/dhcp": act_dhcp,
                       "/api/network": act_network, "/api/service": act_service, "/api/system": act_system,
-                      "/api/cert": act_cert, "/api/vpn": act_vpn}
+                      "/api/cert": act_cert, "/api/vpn": act_vpn, "/api/vpnuser": act_vpnuser}
             if u.path == "/api/password":
                 return self.send_json(act_password(d, s["user"]))
             if u.path in routes:

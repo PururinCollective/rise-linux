@@ -394,10 +394,7 @@ async function viewVpn(main) {
 		}), "no VPN sessions"));
 	};
 	fillSessions(ses);
-	usersBody.replaceChildren(users.ok ? table(["User", "Full name", "Auth", "Logins", "Last login", "Expires"],
-		users.users.map(u => [u["User Name"] || "", u["Full Name"] || "", u["Auth Method"] || "", u["Num Logins"] || "",
-			u["Last Login"] || "", u["Expiration Date"] || ""]), "no users yet: add them with SoftEther VPN Server Manager")
-		: h("div", { class: "alert warn" }, "SoftEther did not answer."));
+	usersPanel(usersBody, users);
 
 	const net = h("form", { class: "form" },
 		field("Gateway IPv4", input("VPN_IPV4", conf.VPN_IPV4), "this server's address on the VPN side"),
@@ -417,7 +414,7 @@ async function viewVpn(main) {
 	put(main, pageHead("VPN", `${conf.VPN_DOMAIN || ""} · hub ${conf.VPN_HUB}`),
 		h("div", { class: "grid" },
 			card("Sessions", sesBody, { wide: true }),
-			card("Users", [usersBody, h("p", { class: "hint" }, "Users, groups and hub policies are managed with SoftEther VPN Server Manager, connecting to ", h("span", { class: "mono" }, `${conf.VPN_DOMAIN || "this server"}:443`), " with the server admin password.")], { wide: true }),
+			card("Users", [usersBody, h("p", { class: "hint" }, "Groups, hub policies and certificate logins: SoftEther VPN Server Manager, connecting to ", h("span", { class: "mono" }, `${conf.VPN_DOMAIN || "this server"}:443`), " with the server admin password.")], { wide: true }),
 			card("VPN network", [net, h("div", { class: "actions" }, act("Save & Apply", "settings", () => formData(net), { cls: "primary" }))]),
 			h("div", {},
 				card("Connect", kv([
@@ -434,6 +431,129 @@ async function viewVpn(main) {
 	S.timer = setInterval(async () => { if (live()) { try { fillSessions(await api("sessions")); } catch (e) { /* later */ } } }, 10000);
 }
 
+// ---- VPN users ----------------------------------------------------------------------------------
+
+const DAY = 86400;
+function genPassword(n = 16) {
+	const a = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+	const r = crypto.getRandomValues(new Uint32Array(n));
+	return Array.from(r, x => a[x % a.length]).join("");
+}
+function pad2(n) { return String(n).padStart(2, "0"); }
+function localInput(ts) { // UNIX time -> <input type=datetime-local> value, browser time
+	const d = new Date(ts * 1000);
+	return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+function expiryText(ts, now) {
+	if (!ts) return h("span", { class: "chip dim" }, "never");
+	const left = ts - now, d = new Date(ts * 1000);
+	const date = d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) + " " +
+		d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+	const days = Math.ceil(left / DAY);
+	const c = left <= 0 ? h("span", { class: "chip bad" }, "expired")
+		: h("span", { class: "chip " + (days <= 7 ? "warn" : "dim") }, left < DAY ? "today" : `${days} d`);
+	return h("span", { class: "inline nowrap" }, h("span", { class: "mono" }, date), c);
+}
+
+// never | in N days | on a date and time; value() gives what /api/vpnuser takes
+function expiryPicker(ts) {
+	const now = Date.now() / 1000;
+	const mode = select("mode", ts ? "at" : "never", [["never", "Never"], ["days", "In a number of days"], ["at", "On a date"]]);
+	const days = input("days", "30", { type: "number", min: 1, max: 3650, step: 1 });
+	const at = input("at", localInput(ts && ts > now ? ts : Math.floor(now / 60) * 60 + 30 * DAY), { type: "datetime-local" });
+	const quick = h("span", { class: "inline" }, [7, 30, 90, 365].map(n => h("button", {
+		class: "btn small", type: "button",
+		onclick: () => { mode.value = "days"; days.value = n; sync(); },
+	}, n === 365 ? "1 year" : `${n} days`)));
+	const until = h("span", { class: "hint-inline" });
+	const sync = () => {
+		days.hidden = mode.value !== "days";
+		at.hidden = mode.value !== "at";
+		const v = value();
+		until.textContent = v.mode === "never" || !(v.days || v.at) ? "" :
+			"until " + new Date(((v.at) || (Date.now() / 1000 + v.days * DAY)) * 1000).toLocaleString();
+	};
+	const value = () => {
+		if (mode.value === "days") return { mode: "days", days: parseInt(days.value, 10) || 0 };
+		if (mode.value === "at") return { mode: "at", at: at.value ? Math.floor(new Date(at.value).getTime() / 1000) : 0 };
+		return { mode: "never" };
+	};
+	for (const e of [mode, days, at]) { e.addEventListener("input", sync); e.addEventListener("change", sync); }
+	sync();
+	return { el: h("div", { class: "stack" }, h("div", { class: "inline" }, mode, days, at), quick, until), value };
+}
+
+function usersPanel(body, users) {
+	const editor = h("div", { class: "editor" });
+	const reload = async () => usersPanel(body, await api("users"));
+	const send = async (btn, payload, then) => {
+		btn.disabled = true;
+		try {
+			const r = await api("vpnuser", payload);
+			toast(r.message || "done", r.ok !== false);
+			if (r.ok !== false) await (then || reload)();
+		} catch (e) { if (e.message !== "login") toast(e.message, false); }
+		btn.disabled = false;
+	};
+	const open = (title, form, onSave, saveLabel = "Save") => {
+		const save = h("button", { class: "btn primary", type: "submit" }, saveLabel);
+		const f = h("form", { class: "form" }, form, h("div", { class: "full actions" },
+			h("button", { class: "btn", type: "button", onclick: () => editor.replaceChildren() }, "Cancel"), save));
+		f.addEventListener("submit", ev => { ev.preventDefault(); onSave(save); });
+		editor.replaceChildren(h("h3", {}, title), f);
+		editor.scrollIntoView({ block: "nearest", behavior: "smooth" });
+		const first = f.querySelector("input:not([hidden]), select");
+		if (first) first.focus();
+	};
+	const pwField = () => {
+		const pw = input("password", genPassword(), { required: true, maxlength: 255 });
+		const gen = h("button", { class: "btn small", type: "button", onclick: () => { pw.value = genPassword(); pw.focus(); } }, "Generate");
+		return { pw, el: h("div", { class: "inline" }, pw, gen) };
+	};
+	const addUser = () => {
+		const name = input("name", "", { required: true, maxlength: 63, pattern: "[A-Za-z0-9][A-Za-z0-9._@\\-]*", placeholder: "alice" });
+		const real = input("realname", "", { maxlength: 127 });
+		const note = input("note", "", { maxlength: 127 });
+		const p = pwField(), exp = expiryPicker(null);
+		open("Add a user", [
+			field("User name", name, "letters, digits and . _ @ -"),
+			field("Password", p.el, "shown so you can pass it on; short ones work but are easy to guess"),
+			field("Full name", real), field("Description", note),
+			field("Expires", exp.el),
+		], btn => send(btn, { action: "add", name: name.value.trim(), password: p.pw.value, realname: real.value,
+			note: note.value, expires: exp.value() }), "Add user");
+	};
+	const setPassword = u => {
+		const p = pwField();
+		open(`Password of ${u}`, [field("New password", p.el)],
+			btn => send(btn, { action: "password", name: u, password: p.pw.value }, async () => editor.replaceChildren()));
+	};
+	const setExpiry = (u, ts) => {
+		const exp = expiryPicker(ts);
+		open(`Expiry of ${u}`, [field("Expires", exp.el, users.tz ? `the server keeps time in ${users.tz}` : null)],
+			btn => send(btn, { action: "expires", name: u, expires: exp.value() }));
+	};
+
+	if (!users.ok) { body.replaceChildren(h("div", { class: "alert warn" }, "SoftEther did not answer.")); return; }
+	const now = users.now || Date.now() / 1000;
+	const rows = users.users.map(u => {
+		const name = u["User Name"] || "";
+		return [name, u["Full Name"] || "", u["Auth Method"] || "", u["Num Logins"] || "", u["Last Login"] || "",
+			h("span", { title: u["Expiration Date"] || "" }, expiryText(u.expires_ts, now)),
+			h("span", { class: "inline nowrap" },
+				h("button", { class: "btn small", type: "button", onclick: () => setPassword(name) }, "Password"),
+				h("button", { class: "btn small", type: "button", onclick: () => setExpiry(name, u.expires_ts) }, "Expiry"),
+				h("button", {
+					class: "btn small danger", type: "button",
+					onclick: ev => { if (confirm(`Delete ${name}? Whoever is connected as ${name} is disconnected.`)) send(ev.currentTarget, { action: "delete", name }); },
+				}, "Delete"))];
+	});
+	body.replaceChildren(
+		table(["User", "Full name", "Auth", "Logins", "Last login", "Expires", ""], rows, "no users yet"),
+		h("div", { class: "actions" }, h("button", { class: "btn primary", type: "button", onclick: addUser }, "Add user")),
+		editor);
+}
+
 // ---- network ------------------------------------------------------------------------------------
 
 async function viewNetwork(main) {
@@ -445,9 +565,19 @@ async function viewNetwork(main) {
 		field("IPv6", select("v6", n.v6, [["auto", "Automatic (RA, DHCPv6)"], ["static", "Static"], ["off", "Disabled"]])),
 		field("Address/prefix", input("addr6", n.addr6, { placeholder: "2001:db8::10/64" })),
 		field("Gateway", input("gw6", n.gw6)),
+		field("IPv6 token", h("div", { class: "inline" }, input("token6", n.token6 || "", { placeholder: "::45" }),
+			h("button", {
+				class: "btn small", type: "button", onclick: () => {
+					const v4 = (formData(wan).v4 === "static" ? formData(wan).addr4 : ((n.live || {}).v4 || [])[0] || "").split("/")[0];
+					if (/^\d+\.\d+\.\d+\.\d+$/.test(v4)) wan.querySelector("[name=token6]").value = "::" + v4.split(".")[3];
+					else toast("no IPv4 address to take it from", false);
+				},
+			}, "From IPv4")),
+			"automatic IPv6 address ends with this (151.158.198.45 → ::45); empty: from the MAC"),
 		field("DNS servers", input("dns", n.dns), "spaces between; needed with a static IPv4"));
 	const sync = () => {
 		const d = formData(wan);
+		wan.querySelectorAll("[name=token6]").forEach(e => { e.disabled = d.v6 !== "auto"; });
 		wan.querySelectorAll("[name=addr4],[name=gw4]").forEach(e => { e.disabled = d.v4 !== "static"; });
 		wan.querySelectorAll("[name=addr6],[name=gw6]").forEach(e => { e.disabled = d.v6 !== "static"; });
 	};
