@@ -234,6 +234,26 @@ ask_network() {
 			break
 		done
 	fi
+	ask_token6 "$cur4"
+}
+
+# The automatic (SLAAC) IPv6 address with a fixed interface part taken from
+# the IPv4 address's last octet, written as is: 151.158.198.45 -> <prefix>::45.
+# Easy to remember, and it stays the same when the network card changes.
+TOKEN6=
+ask_token6() {
+	local v4=${IP4:-} last on=on out
+	[ "$NET6" = auto ] || { TOKEN6=; return 0; }
+	[ "$NET4" = static ] || v4=${1:-}
+	v4=${v4%/*}
+	[ -n "$v4" ] || { TOKEN6=; return 0; }
+	last=${v4##*.}
+	[ -n "${TOKEN6_ASKED:-}" ] && [ -z "$TOKEN6" ] && on=off
+	out=$(D "Network: $WAN_IF IPv6" --checklist \
+		"\nThe automatic IPv6 address ends with a part made from the network card's MAC. An address token fixes it instead:\n\n   IPv4 $v4  ->  IPv6 <prefix>::$last\n\n(Addresses handed out by DHCPv6 are not affected.)\n" 16 74 1 \
+		token "Use token ::$last (derived from the IPv4 last octet)" "$on") || return 0
+	TOKEN6_ASKED=1
+	case "$out" in *token*) TOKEN6="::$last" ;; *) TOKEN6= ;; esac
 }
 
 ask_profile() {
@@ -433,7 +453,7 @@ summary() {
 	local rc
 	local n4 n6
 	if [ "$NET4" = dhcp ]; then n4="DHCP"; else n4="$IP4 via $GW4, DNS $DNS4"; fi
-	case "$NET6" in auto) n6="automatic" ;; off) n6="disabled" ;; *) n6="$IP6 via $GW6" ;; esac
+	case "$NET6" in auto) n6="automatic${TOKEN6:+, token $TOKEN6}" ;; off) n6="disabled" ;; *) n6="$IP6 via $GW6" ;; esac
 	D "Summary" --yes-label "Install" --no-label "Back" --yesno \
 "\n\
   Disk            \Zb$DISK\Zn  (\Z1erased\Zn)  $(lsblk -dno SIZE,MODEL "$DISK" 2>/dev/null)\n\
@@ -479,7 +499,8 @@ write_netplan() {
 		echo "      set-name: $WAN_IF"
 		if [ "$NET4" = dhcp ]; then echo "      dhcp4: true"; else echo "      dhcp4: false"; fi
 		case "$NET6" in
-		auto) echo "      dhcp6: true"; echo "      accept-ra: true" ;;
+		auto) echo "      dhcp6: true"; echo "      accept-ra: true"
+			[ -n "$TOKEN6" ] && echo "      ipv6-address-token: \"$TOKEN6\"" ;;
 		static) echo "      dhcp6: false"; echo "      accept-ra: false" ;;
 		off) echo "      dhcp6: false"; echo "      accept-ra: false"; echo "      link-local: [ ipv4 ]" ;;
 		esac

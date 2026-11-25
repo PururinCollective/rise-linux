@@ -56,7 +56,8 @@ a hybrid ISO for BIOS and UEFI, for DVD or USB:
 3. **softether**: compile SoftEther VPN inside the chroot, into `/opt/softether`.
    The source is `SOFTETHER_SRC` (default `../SoftEtherVPN`). A local checkout is
    copied as it is, uncommitted changes included, and its submodules are fetched
-   into the copy.
+   into the copy. RISE's own fixes in `patches/softether/` are then applied to
+   the copy (and skipped when the source already has them).
 4. **fullcone**: build `xt_FULLCONENAT` with DKMS, plus its `libipt_`/`libip6t_`
    iptables extensions.
 5. **overlay**: copy `rootfs/` and apply the system settings (console, GRUB, sshd,
@@ -104,7 +105,9 @@ for:
 
 1. **Storage**: the disk to erase.
 2. **Network**: the WAN interface (`eth0`), IPv4 by DHCP or static, and IPv6 as
-   automatic, static or off.
+   automatic, static or off. With automatic IPv6 you can take an address token
+   from the IPv4 address's last octet: with `151.158.198.45` the automatic
+   address becomes `<prefix>::45` instead of one made from the MAC address.
 3. **Profile setup**: your name, the server's hostname, the sudo user and its
    password, and optionally an SSH identity to import (`gh:user` or `lp:user`).
 4. **VPN domain**: the name for Let's Encrypt and the WebGUI (different from the
@@ -186,6 +189,14 @@ IPv6CP. All client traffic therefore passes through the server's firewall. With
 access list allows unicast frames only to and from the gateway's MAC address, so
 a client with a hand-set `/24` cannot get around it at layer 2.
 
+L2TP, SSTP and OpenVPN in TUN mode reach the hub through SoftEther's in-process
+client, which did not handle a `/32` lease: it never learned the gateway's MAC
+address (outside its subnet) and dropped packets for the on-link route. RISE
+patches it (`patches/softether/0001`). OpenVPN clients also cannot route through
+a gateway outside a `/32`, so in TUN mode the server pushes the smallest subnet
+that holds the gateway, a `/24` here (`0002`); isolation does not depend on the
+client's netmask.
+
 ### Full cone NAT
 
 `xt_FULLCONENAT` provides endpoint-independent mapping and filtering, so peer-to-peer
@@ -224,8 +235,9 @@ rise console-mode 1920x1080 | native | 1024x768
 | `/opt/softether/` | SoftEther VPN; `vpn_server.config` is under `libexec/softether/vpnserver/` |
 | `/usr/lib/rise/` | firewall, vpn-net, dnsmasq-gen, softether-setup, cert, console, banner, statsd, installer |
 
-To manage users, groups and hub policies, connect SoftEther VPN Server Manager
-to `<domain>:443` with the server administrator password.
+VPN users (add, delete, password, expiry) are on the WebGUI's VPN page. For
+groups, hub policies and certificate logins, connect SoftEther VPN Server
+Manager to `<domain>:443` with the server administrator password.
 
 ## The WebGUI
 
@@ -244,6 +256,10 @@ that uses only the standard library and serves HTTPS on both IPv4 and IPv6.
 - VPN clients cannot reach the WebGUI; the firewall drops all their traffic to
   the server.
 
+VPN users: add one with a generated (or your own) password, change a password,
+delete one (its sessions are disconnected), and set when it expires: never, in
+a number of days, or on a date and time picked in the browser's time zone.
+
 ## Repository layout
 
 ```text
@@ -251,6 +267,7 @@ build.sh                 the whole build, base system to ISO
 config/build.conf        build settings
 config/packages.list     the system's packages
 iso/grub.cfg             the ISO's boot menu
+patches/softether/       RISE's fixes to SoftEther, applied at build time
 rootfs/                  copied over the system: RISE scripts, systemd units, WebGUI
 example/*.sample         the SoftEther setup RISE started from (sanitized)
 ```
