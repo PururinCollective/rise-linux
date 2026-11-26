@@ -38,7 +38,7 @@ needs.
 | SSH | Port `9122`. root cannot log in; the installer creates a sudo user |
 | WebGUI | `https://<domain>:18080`: status, live traffic and peak speeds, sessions, port forwarding (IPv4/IPv6), DHCP static leases, WAN settings, certificate, services, logs, reboot |
 | Console | Unifont 8×16 (the Ubuntu Server installer's font) at 1024×768, doubled to 16×32 on screens 1920 pixels wide or more |
-| Boot | A centred, animated banner on tty1, and a live login screen showing addresses and speed |
+| Boot | A centred, animated banner on tty1, then a status screen with the addresses, speed, services and load; login shells on tty2 to tty6 |
 
 ## Build
 
@@ -127,7 +127,15 @@ for:
 8. **Summary**: if the WAN address is private, it lists the ports to forward.
 
 The disk gets a BIOS boot partition, an EFI partition and the root filesystem,
-with GRUB installed for both, so it boots in either firmware mode.
+with GRUB installed for both, so it boots in either firmware mode. **Reboot** on
+the last page ejects the installation DVD and restarts the machine at once: the
+live system runs from that DVD, so it does not go through a normal shutdown
+after the eject.
+
+After the boot, tty1 shows a status screen: the banner, the WebGUI address, the
+services and the load, redrawn every 5 seconds. Log in on tty2 to tty6
+(Ctrl+Alt+F2 to F6). For a login prompt on tty1 instead, set
+`CONSOLE_STATUS="0"` in `/etc/rise/rise.conf` and reboot.
 
 On the first boot, `rise-firstboot` sets up SoftEther through `vpncmd`: the
 admin password, the `VPN` hub, the TAP bridge, L2TP/IPsec, OpenVPN, SSTP, the

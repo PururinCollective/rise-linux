@@ -10,7 +10,10 @@ WEBGUI_PORT="18080"
 # 3840x2160 or native); the font doubles on wide screens (auto, 1, 2)
 CONSOLE_MODE="1024x768"
 CONSOLE_FONT_SCALE="auto"
-# the login screen on tty1 refreshes its IP and speed lines (seconds, 0 = off)
+# tty1 after the boot: 1 = the status screen (the services and the load; the
+# shells are on tty2-6, Ctrl+Alt+F2..F6), 0 = a login prompt
+CONSOLE_STATUS="1"
+# the login screens refresh their IP and speed lines (seconds, 0 = off)
 ISSUE_REFRESH="10"
 
 # ---- VPN ------------------------------------------------------------------------

@@ -437,7 +437,7 @@ GR
 	systemctl disable ssh.socket 2>/dev/null || true
 	systemctl enable ssh.service systemd-networkd.service systemd-resolved.service systemd-timesyncd.service
 	systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
-	systemctl enable rise-console.service rise-splash.service rise-issue.timer \
+	systemctl enable rise-console.service rise-splash.service rise-status.service rise-issue.timer \
 		rise-firewall.service rise-vpnserver.service rise-dnsmasq.service \
 		rise-webgui.service rise-firstboot.service rise-cert.timer rise-stats.service \
 		rise-installer.service

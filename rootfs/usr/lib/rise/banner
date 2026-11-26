@@ -9,6 +9,9 @@
 #           it changed (rise-issue.timer, every ISSUE_REFRESH seconds)
 #   login   the banner for an interactive login shell: a short wipe on ssh,
 #           at once on the console
+#   status  the tty1 screen after the boot (rise-status.service): the banner,
+#           the WebGUI address, the services and the load, redrawn every
+#           STATUS_REFRESH seconds; the shells are on tty2-6
 #   print   the banner once, no animation (for scripts and testing)
 #
 # RISE_COLOR=none|16|256|truecolor and RISE_COLS/RISE_ROWS override detection.
@@ -254,7 +257,8 @@ issue() {
 	body=$(render)
 	top=$(( (ROWS - 14) / 2 )); [ $top -lt 0 ] && top=0
 	{
-		printf '\e]P3E95420'
+		# a clear screen first: agetty prints the issue again at each reload
+		printf '\e]P3E95420\e[H\e[2J'
 		printf '%*s' "$top" '' | tr ' ' '\n'
 		# agetty reads backslash escapes in /etc/issue
 		printf '%s\n' "${body//\\/\\\\}"
@@ -266,6 +270,99 @@ issue() {
 		agetty --reload 2>/dev/null || true
 	fi
 	rm -f /run/rise/issue.new
+}
+
+# ---- the tty1 status screen ------------------------------------------------------------
+
+# the WebGUI's list (server.py)
+STATUS_UNITS=(rise-vpnserver rise-dnsmasq rise-firewall rise-webgui rise-stats ssh)
+
+uptime_text() {
+	local s d h m
+	read -r s _ < /proc/uptime; s=${s%.*}
+	d=$(( s / 86400 )); h=$(( s % 86400 / 3600 )); m=$(( s % 3600 / 60 ))
+	if [ $d -gt 0 ]; then printf '%dd %dh %dm' $d $h $m; else printf '%dh %dm' $h $m; fi
+}
+
+mem_text() {
+	awk '/^MemTotal:/ {t = $2} /^MemAvailable:/ {a = $2}
+		END { printf "%d MiB of %d MiB", (t - a) / 1024, t / 1024 }' /proc/meminfo
+}
+
+# one line of the screen: centered on its visible width $2, the rest cleared
+sline() { printf '%s%s\e[K\n' "$(lpad "$2")" "$1"; }
+
+status_frame() {
+	local lines=() vis=() l i state c
+	block_width
+	# the banner, without the screen's own padding
+	mapfile -t lines < <(COLS=$BW render)
+	for i in "${!lines[@]}"; do vis[i]=$BW; done
+
+	local url="https://${VPN_DOMAIN:-${IP4:-<address>}}:${WEBGUI_PORT:-18080}"
+	lines+=("" "${C_LABEL}WebGUI${C_0}  ${C_WHITE}$url${C_0}" "")
+	vis+=(0 $(( 8 + ${#url} )) 0)
+
+	# the services, two to a row
+	local states=()
+	mapfile -t states < <(systemctl is-active "${STATUS_UNITS[@]/%/.service}" 2>/dev/null)
+	local cells=() cw=27 row=''
+	for i in "${!STATUS_UNITS[@]}"; do
+		state=${states[i]:-unknown}
+		case "$state" in
+		active) c=$'\e[0;32m' ;;
+		failed) c=$'\e[1;31m' ;;
+		activating|reloading|deactivating) c=$'\e[1;33m' ;;
+		*) c=$C_DIM ;;
+		esac
+		[ "$C_0" ] || c=
+		printf -v l '%s*%s %-16s %s%-8s%s' "$c" "$C_0" "${STATUS_UNITS[i]}" "$c" "$state" "$C_0"
+		cells+=("$l")
+	done
+	for (( i = 0; i < ${#cells[@]}; i += 2 )); do
+		row=${cells[i]}
+		[ -n "${cells[i+1]:-}" ] && row+="      ${cells[i+1]}"
+		lines+=("$row"); vis+=($(( ${cells[i+1]:+cw + 6 +} cw )))
+	done
+
+	local load
+	read -r load _ < /proc/loadavg
+	l="up $(uptime_text) | load $load | memory $(mem_text)"
+	lines+=("" "${C_DIM}$l${C_0}"); vis+=(0 ${#l})
+
+	# the block in the middle of the screen, the hint on the last line
+	local top=$(( (ROWS - ${#lines[@]} - 2) / 2 ))
+	[ $top -lt 0 ] && top=0
+	for (( i = 0; i < top; i++ )); do printf '\e[K\n'; done
+	for i in "${!lines[@]}"; do sline "${lines[i]}" "${vis[i]}"; done
+	printf '\e[J'
+	local hint="Press Ctrl+Alt+F2 to F6 for a login shell"
+	printf '\e[%d;1H%s%sPress %sCtrl+Alt+F2%s to %sF6%s%s for a login shell%s' "$ROWS" "$(lpad ${#hint})" \
+		"$C_VAL" "$C_WHITE" "$C_0" "$C_WHITE" "$C_0" "$C_VAL" "$C_0"
+}
+
+status() {
+	export TERM=linux
+	term_size
+	console_palette
+	set_colors "$(color_mode)"
+	stty -echo -icanon 2>/dev/null || true
+	printf '\e[?25l\e[2J'
+	trap 'printf "\e[0m\e[?25h\e[2J\e[H"; stty sane 2>/dev/null' EXIT
+	trap 'exit 0' TERM INT HUP
+	local t=${STATUS_REFRESH:-5} rc
+	case "$t" in ''|0|*[!0-9]*) t=5 ;; esac
+	while :; do
+		# the settings can change (the WebGUI port, the domain)
+		# shellcheck disable=SC1090
+		[ -r "${RISE_CONF:-}" ] && . "$RISE_CONF"
+		term_size
+		collect
+		printf '\e[H%s' "$(status_frame)"
+		# a key redraws at once; the keys are not echoed
+		read -rsn1 -t "$t" _; rc=$?
+		[ $rc = 1 ] && sleep "$t"   # no terminal input (end of file)
+	done
 }
 
 # ---- login shells ----------------------------------------------------------------------
@@ -308,6 +405,7 @@ case "${1:-print}" in
 splash) splash ;;
 issue) issue ;;
 login) login ;;
+status) status ;;
 print) term_size; set_colors "$(color_mode)"; collect; render ;;
-*) echo "usage: $0 splash|issue|login|print" >&2; exit 2 ;;
+*) echo "usage: $0 splash|issue|status|login|print" >&2; exit 2 ;;
 esac

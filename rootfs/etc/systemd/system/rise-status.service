@@ -1,0 +1,22 @@
+[Unit]
+Description=RISE status screen on tty1 (the shells are on tty2-6)
+After=rise-splash.service rise-console.service systemd-user-sessions.service
+Before=getty.target
+ConditionKernelCommandLine=!rise.installer
+ConditionPathExists=/dev/tty1
+
+[Service]
+ExecCondition=/usr/lib/rise/console tty1 status
+ExecStart=/usr/lib/rise/banner status
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Environment=TERM=linux
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -8,6 +8,9 @@
 #   mode MODE   the resolution: 1024x768 (the default), another WxH, or native.
 #               Writes GRUB_GFXMODE and video= into /etc/default/grub and runs
 #               update-grub; takes effect at the next boot
+#   tty1 status|login
+#               true when tty1 is that (CONSOLE_STATUS); the ExecCondition of
+#               rise-status.service and getty@tty1.service
 . /usr/lib/rise/common.sh
 
 FONT=/usr/share/consolefonts/Uni2-Fixed16.psf.gz
@@ -63,8 +66,15 @@ PY
 	log "console mode $m from the next boot"
 }
 
+tty1() {
+	local want=login
+	is_on "${CONSOLE_STATUS:-1}" && want=status
+	[ "$1" = "$want" ]
+}
+
 case "${1:-font}" in
 font) font ;;
 mode) mode "${2:-}" ;;
-*) echo "usage: $0 font|mode MODE" >&2; exit 2 ;;
+tty1) tty1 "${2:-}" ;;
+*) echo "usage: $0 font|mode MODE|tty1 status|login" >&2; exit 2 ;;
 esac
