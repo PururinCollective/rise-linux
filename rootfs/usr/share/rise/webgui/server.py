@@ -918,6 +918,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def body_json(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n > 65536:
+            self.close_connection = True  # the body stays unread
             raise Bad("request too large")
         try:
             d = json.loads(self.rfile.read(n) or b"{}")
@@ -990,10 +991,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         u = urlparse(self.path)
         ip = self.client_address[0]
         try:
+            # the body first, whatever the answer: an unread body on a kept-alive
+            # connection would be read as the start of the next request
+            d = self.body_json()
             if u.path == "/api/login":
                 if login_blocked(ip):
                     return self.send_json({"ok": False, "message": "too many attempts; wait five minutes"}, 429)
-                d = self.body_json()
                 try:
                     auth = json.load(open(AUTH_FILE))
                 except (OSError, ValueError):
@@ -1021,7 +1024,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with LOCK:
                     SESSIONS.pop(s["token"], None)
                 return self.send_json({"ok": True}, cookie="rise_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
-            d = self.body_json()
             routes = {"/api/settings": act_settings, "/api/portfwd": act_portfwd, "/api/dhcp": act_dhcp,
                       "/api/network": act_network, "/api/service": act_service, "/api/system": act_system,
                       "/api/cert": act_cert, "/api/vpn": act_vpn, "/api/vpnuser": act_vpnuser}

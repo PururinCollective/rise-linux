@@ -168,9 +168,10 @@ function isDark() {
 
 function brand(host) {
 	const logo = h("span", { class: "logo" });
-	fetch("logo.svg").then(r => r.text()).then(t => {
+	fetch("logo.svg").then(r => r.ok ? r.text() : Promise.reject(r.status)).then(t => {
 		const doc = new DOMParser().parseFromString(t, "image/svg+xml");
-		logo.append(document.importNode(doc.documentElement, true));
+		// a parse error comes back as a document too; show no logo then
+		if (doc.documentElement.localName === "svg") logo.append(document.importNode(doc.documentElement, true));
 	}).catch(() => {});
 	return h("a", { class: "brand", href: "#status" }, logo, h("span", { class: "host" }, host || "RISE Linux"));
 }
