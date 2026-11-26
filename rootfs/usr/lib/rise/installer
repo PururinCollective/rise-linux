@@ -690,18 +690,36 @@ run_install() {
 finish() {
 	D "Install complete" --yes-label "Reboot" --no-label "Shell" --yesno \
 "\n\ZbRISE Linux is installed.\Zn\n\n\
-Remove the installation medium, then reboot.\n\n\
+Reboot ejects the installation medium and restarts this machine.\n\n\
 At the first boot SoftEther is configured$([ -n "$VPN_DOMAIN" ] && echo " and the certificate of\n$VPN_DOMAIN is requested (port 80 must reach this server)").\n\n\
   WebGUI   https://$(server_addr):18080\n\
   SSH      ssh -p 9122 $USERNAME@$(server_addr)\n\
   VPN      SoftEther Server Manager: $(server_addr), port 443 or 5555\n\n\
 \Z3Silent by design. Secure by nature.\Zn" 20 76 >/dev/null
-	if [ $? = 0 ]; then
-		eject -m /cdrom >/dev/null 2>&1 || true
-		systemctl reboot
-		sleep 30
-	fi
+	[ $? = 0 ] && reboot_now
+
 	clear; bash -l </dev/tty >/dev/tty 2>&1
+}
+
+# The live system runs from the installation medium (its root is the squashfs
+# on /cdrom), so after the eject a normal shutdown reads pages that are gone:
+# I/O errors and bus errors, and no reboot. The target is synced and unmounted
+# and the live system keeps nothing, so the machine is reset at once, with
+# bash builtins only after the eject.
+reboot_now() {
+	clear
+	echo "Rebooting..."
+	sync
+	local dev
+	dev=$(findmnt -no SOURCE /cdrom 2>/dev/null) || dev=
+	case "$dev" in
+	/dev/sr*) eject -m "$dev" >/dev/null 2>&1 || true ;;
+	esac
+	echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
+	echo b > /proc/sysrq-trigger 2>/dev/null
+	# no sysrq: the usual way, which works when the medium is still there
+	systemctl reboot
+	read -rt 30 _ <> /dev/tty
 }
 
 main() {
